@@ -53,6 +53,19 @@ export async function requireAuth(
 }
 
 /**
+ * Reads the caller's role from Firestore. Shared by requireAdmin and by
+ * handlers that grant admin-only read access (e.g. order ownership checks).
+ */
+export async function hasAdminRole(uid: string): Promise<boolean> {
+  const { db } = requireFirebase();
+  const snapshot = await db.doc(`users/${uid}`).get();
+  const role = snapshot.exists
+    ? (snapshot.data()?.['role'] as unknown)
+    : undefined;
+  return role === 'admin';
+}
+
+/**
  * Requires the authenticated user's Firestore profile to have role = 'admin'.
  * The role is read server-side from the `users` collection on every request;
  * frontend flags, local storage or route hiding are never consulted.
@@ -64,12 +77,7 @@ export async function requireAdmin(
 ): Promise<void> {
   try {
     const user = getAuth(req);
-    const { db } = requireFirebase();
-    const snapshot = await db.doc(`users/${user.uid}`).get();
-    const role = snapshot.exists
-      ? (snapshot.data()?.['role'] as unknown)
-      : undefined;
-    if (role !== 'admin') {
+    if (!(await hasAdminRole(user.uid))) {
       throw forbidden('Administrator privileges are required.');
     }
     next();

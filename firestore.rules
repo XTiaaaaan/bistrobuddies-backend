@@ -21,7 +21,8 @@ service cloud.firestore {
         && get(userDocPath(myUid())).data.role == 'admin';
     }
 
-    // users: a customer may only read/edit their own profile; admins may read all.
+    // users: private profile data. A customer may only read/edit their own
+    // profile; admins may read all. Nobody may escalate their own role.
     match /users/{uid} {
       allow get: if isSignedIn() && (myUid() == uid || isAdmin());
       allow list: if isAdmin();
@@ -38,35 +39,32 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // products: readable by signed-in users, writable by admins only.
+    // products: the catalog is the only publicly readable collection.
+    // All writes go through the trusted API (Admin SDK bypasses these rules).
     match /products/{productId} {
-      allow read: if isSignedIn();
+      allow read: if true;
       allow create, update, delete: if isAdmin();
     }
 
-    // orders: customers may read/create only their own orders.
-    // Status and totals may only be changed by admins (or trusted backend).
+    // orders: private. Reads are limited to the owning customer and admins.
+    // Clients may NOT create orders — order prices/totals must be computed by
+    // the trusted backend (POST /api/orders), which uses the Admin SDK and is
+    // not affected by this rule. Only admins (or the backend) may change
+    // orderStatus / paymentStatus, so customers cannot alter statuses.
     match /orders/{orderId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());
-      allow create: if isSignedIn()
-        && request.resource.data.customerId == myUid()
-        && request.resource.data.orderStatus == 'PENDING'
-        && request.resource.data.paymentStatus == 'PENDING'
-        && request.resource.data.total
-          == request.resource.data.subtotal + request.resource.data.deliveryFee;
+      allow create: if false;
       allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
-    // payments: customers may read/create only their own payment records.
-    // paymentStatus may only be changed by admins or a trusted backend.
+    // payments: private. Only the backend creates payment records (PayMongo
+    // integration, not yet implemented) and only admins may change a status.
     match /payments/{paymentId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());
-      allow create: if isSignedIn()
-        && request.resource.data.customerId == myUid()
-        && request.resource.data.status == 'PENDING';
+      allow create: if false;
       allow update, delete: if isAdmin();
     }
   }
