@@ -59,8 +59,10 @@ Every route exists at both `/api/<path>` and `/<path>` (see §2).
 | POST | `/api/admin/orders/:id/status` | `src/routes/admin-orders.ts:29` | Bearer + admin | 60/min/IP |
 
 **Endpoints that DO NOT exist:** `GET /api/products`, `GET /api/products/:id`,
-`GET /api/admin/orders`, `GET /api/orders`, any webhook, any upload, any payment endpoint.
+`GET /api/admin/orders`, `GET /api/orders`, any webhook, any payment endpoint.
 CORS allows only `GET, POST, PATCH, DELETE, OPTIONS` (`src/app.ts:42`) — there are no `PUT` routes.
+*(A `POST /api/admin/uploads` image-upload endpoint and `GET /uploads/:file`
+static route were added after this audit — see §12.)*
 
 ### POST /api/orders — request/response
 
@@ -163,9 +165,13 @@ Template: `.env.example`. **No `.env` file exists in the repository.**
 | `FIREBASE_SERVICE_ACCOUNT` | *(empty)* | **Inline** service-account JSON (alternative to the above) |
 | `ALLOWED_ORIGINS` | localhost:4200/8100, `capacitor://localhost`, `https://localhost` | CORS allowlist |
 | `TRUST_PROXY` | `0` | Set `1` behind Vercel so `req.ip` is correct for rate limiting |
+| `UPLOAD_DIR` | `uploads` | Local image-upload directory (added after this audit, §12) |
+| `API_BASE_URL` | `http://localhost:<PORT>` | Base URL for returned image `imageUrl`s (added after this audit, §12) |
+| `UPLOAD_MAX_BYTES` | `5242880` (5 MB) | Maximum image upload size (added after this audit, §12) |
 
 There are **no** `PAYMONGO_*`, `*_BUCKET`, or `VERCEL_*` variables anywhere in the code.
-Exactly these 7 names are read (`src/config.ts:70,71,78,79,81,85,87,89`).
+These names are read by `src/config.ts` (the three upload-related names were
+added after this audit — see §12).
 
 ---
 
@@ -217,7 +223,7 @@ Tests need no network or credentials (Firebase is mocked in `src/app.test.ts:5-1
 | Product CRUD | ⚠️ **PARTIAL** | C/U/D exist; **no read endpoints** (`GET /api/products[/:id]`) — clients read Firestore directly |
 | Admin authorization | ✅ **WORKS** | `requireAuth` + `requireAdmin` on all 4 admin routes; 401/403 tested (`src/app.test.ts:337-353,470-475`) |
 | Admin order management | ⚠️ **PARTIAL** | Status transition exists; **no order list/detail endpoint** for admins |
-| Localhost image uploads (dev) | ❌ **MISSING** | No upload route, no multipart parser, no static serving. Only a `.gitignore:34-36` comment anticipating `uploads/` and `public/uploads/` |
+| Localhost image uploads (dev) | ✅ **WORKS** (added after this audit) | `POST /api/admin/uploads` (admin-only, multer, magic-byte type check, 5 MB cap, rate-limited) + `GET /uploads/:file`; storage in `UPLOAD_DIR` (git-ignored). See §12, `README.md`, `docs/API_CONTRACT.md` §6 |
 | Firebase Storage (production) | ❌ **MISSING** | No `getStorage`/`bucket()` usage, no bucket env var |
 | PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'ONLINE'` is stored but inert (`src/services/orders.service.ts:89`) |
 | Secrets server-side | ✅ **WORKS** | No secrets in repo; `.env.example` placeholders empty |
@@ -268,3 +274,41 @@ and changed **no** data.
 
 ⚠️ `README.md:20,48,81` references `../integration-docs/` (`API_CONTRACT.md`, `ENVIRONMENT_VARIABLES.md`).
 **That directory does not exist** in `D:\bistrobuddies`. This file supersedes those references until it is created.
+
+---
+
+## 12. Addendum — local image uploads (added after this audit)
+
+Implemented in `bistrobuddies-backend` only; nothing was deployed.
+
+| Piece | Where |
+|---|---|
+| Upload route | `src/routes/admin-uploads.ts` — `POST /api/admin/uploads`, guards `[rateLimit 30/min, requireAuth, requireAdmin]` then one `multer` (`memoryStorage`) file in field `file` |
+| Type/size checks | Magic-byte sniffing of JPEG/PNG/WebP in `src/lib/uploads.ts`; limit `UPLOAD_MAX_BYTES` (default 5 MB) enforced by multer → `415 unsupported_media_type` / `413 file_too_large` |
+| Safe names | `<epochMs>-<uuid>.<ext>` generated server-side; `resolveUploadPath()` rejects separators/`..`; the client's file name is discarded |
+| Storage | `UPLOAD_DIR` (default `<repo>/uploads`), created at startup; `.gitignore` excludes `uploads/`, `public/uploads/` and `*-firebase-adminsdk-*.json` (added so a Firebase-Console key download can never be committed) — **local disk, development only** |
+| Serving | `express.static` at `GET /uploads/:file` (`src/app.ts`) with `Cross-Origin-Resource-Policy: cross-origin`, no directory listing, 1 h cache |
+| Returned URL | `imageUrl = API_BASE_URL + /uploads/<file>` (absolute) plus backend-relative `path` |
+| Firestore | The upload endpoint writes nothing; the admin site sends `imageUrl` in the product payload, so `products/{id}` stores the **URL string + metadata only** (never bytes/base64) |
+| Tests | `src/admin-uploads.test.ts` — 401/403, unsupported type, oversized, missing field, success (JPEG/PNG/WebP), URL shape, path traversal (upload + static), `.gitignore` coverage |
+| Docs | `README.md` ("Local image uploads"), `docs/API_CONTRACT.md` §6, `.env.example` |
+
+New env vars (§6): `UPLOAD_DIR`, `API_BASE_URL`, `UPLOAD_MAX_BYTES`.
+New dependency: `multer` (+ `@types/multer`).
+
+**Status after implementation:** `npm run typecheck`, `npm run lint`,
+`npm run build` and `npm test` all pass (5 files, **97/97 tests**).
+
+**Credentials (configured locally, 2026-10-09):** `.env` (git-ignored) sets
+`GOOGLE_APPLICATION_CREDENTIALS` to the Firebase-Console key
+`bistrobuddies-4f179-firebase-adminsdk-*.json` in this folder (also
+git-ignored). Verified read-only: ADC access token minted, Firestore read,
+`auth.getUser()` read, `GET /api/health` → `firebaseConfigured: true`,
+`verifyIdToken` successfully fetches Google's public key set.
+
+**Remaining manual action:** live end-to-end upload as the real admin —
+sign in on the admin site (`http://localhost:4200`) and upload one image, or
+enable the **IAM Credentials API** for project `12668682749`
+(`https://console.developers.google.com/apis/api/iamcredentials.googleapis.com/overview?project=12668682749`)
+so an automated custom-token sign-in can be minted. The IAM API is **not**
+used by this backend — only `createCustomToken` (test tooling) needs it.

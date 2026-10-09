@@ -17,13 +17,13 @@ prefix (the router is mounted at both `/api` and `/` for serverless hosts);
 | Base URL | dev `http://localhost:3001/api` (`environment.apiBaseUrl`) |
 | Auth | `Authorization: Bearer <Firebase ID token>` — token verified server-side; identity **never** taken from the request body |
 | Admin | Server reads `users/{uid}.role == 'admin'` from Firestore on every `/admin/*` request |
-| Errors | `{ "error": { "code": "…", "message": "…", "details?": … } }` with status 400/401/403/404/409/413/422/429/500/503 |
+| Errors | `{ "error": { "code": "…", "message": "…", "details?": … } }` with status 400/401/403/404/409/413/415/422/429/500/503 |
 | Currency | **PHP only.** Every price/amount field is returned with `currency: "PHP"` |
 | Prices | Clients **never** send prices. Totals are computed server-side from Firestore product records |
 
 Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
-`GET /api/products*` 120/min; `/api/admin/*` 60/min. Rate-limited responses
-are `429` with a `Retry-After` header.
+`GET /api/products*` 120/min; `/api/admin/*` 60/min; `POST /api/admin/uploads`
+30/min. Rate-limited responses are `429` with a `Retry-After` header.
 
 ---
 
@@ -39,6 +39,7 @@ are `429` with a `Retry-After` header.
 | POST | `/api/admin/products` | Bearer (admin) | Create product → `201 { id }` |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Delete → `{ id }` |
+| POST | `/api/admin/uploads` | Bearer (admin) | Store a product image on the local disk → `201 { imageUrl, … }` (§6, development only) |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Status transition → `{ id, orderStatus }` |
 
 CORS allows `GET, POST, PATCH, DELETE, OPTIONS` from `ALLOWED_ORIGINS`.
@@ -175,9 +176,99 @@ against `bistrobuddies-4f179` — this repository does not deploy anything.**
 
 ---
 
-## 6. Not implemented (out of scope)
+## 6. Image uploads (local development only)
 
-- Image uploads (no upload endpoint, no multipart parsing, no storage bucket).
+> ⚠️ **Development only — not production storage.** Files are written to this
+> machine's disk in `UPLOAD_DIR` (default `uploads/`, git-ignored) and served
+> by the local backend. Local disk is not persistent, not backed up and not
+> shared between instances (a restart or redeploy can lose it); **do not rely
+> on it outside local development.** The production path is Firebase Storage,
+> which is **not implemented** in this repository.
+
+### POST /api/admin/uploads
+
+| Topic | Rule |
+| --- | --- |
+| Auth | `Authorization: Bearer <admin ID token>` — `401 unauthorized` without/with a bad token, `403 forbidden` for non-admin users |
+| Content type | `multipart/form-data` with exactly **one** file field named `file` |
+| Accepted images | **JPEG, PNG, WebP** — verified from the file's magic bytes, never from the client's file name or `Content-Type` → otherwise `415 unsupported_media_type` |
+| Size limit | `UPLOAD_MAX_BYTES`, default **5 MB** (5 242 880 bytes) → `413 file_too_large` |
+| Other fields | none accepted → `400 invalid_request` |
+| Missing/empty file | `400 invalid_request` |
+| Rate limit | 30 requests/min/IP → `429 rate_limited` |
+| Missing server credentials | `503 server_not_configured` |
+
+**Request** (admin site, `environment.apiBaseUrl` = `http://localhost:3001/api`):
+
+```ts
+const form = new FormData();
+form.append('file', file, file.name); // field name must be "file"
+
+const response = await fetch(`${environment.apiBaseUrl}/admin/uploads`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${await admin.getIdToken()}` },
+  body: form, // browser sets multipart/form-data + boundary
+});
+const { imageUrl } = await response.json(); // 201
+```
+
+```bash
+curl -X POST http://localhost:3001/api/admin/uploads \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -F "file=@./latte.png"
+```
+
+**Response `201`:**
+
+```json
+{
+  "imageUrl": "http://localhost:3001/uploads/1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
+  "path": "/uploads/1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
+  "fileName": "1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
+  "mimeType": "image/png",
+  "size": 48213,
+  "uploadedAt": "2026-10-09T12:00:00.000Z"
+}
+```
+
+**Error codes:** `400 invalid_request`, `401 unauthorized`, `403 forbidden`,
+`413 file_too_large`, `415 unsupported_media_type`, `429 rate_limited`,
+`503 server_not_configured`.
+
+### Image URL behaviour
+
+- `imageUrl` is **absolute**, built from `API_BASE_URL` (default
+  `http://localhost:<PORT>`) so frontends on other origins
+  (`http://localhost:4200`, `http://localhost:8100`, Capacitor) can put it
+  straight into `<img src>`; `path` is the backend-relative form of the same
+  file.
+- Files are served read-only by **`GET /uploads/<fileName>`** — no directory
+  listing, no writes, `Cache-Control: max-age=3600`, and
+  `Cross-Origin-Resource-Policy: cross-origin` so cross-origin `<img>` tags
+  are not blocked. Unknown names return `404 not_found`; `..`/encoded path
+  traversal is rejected by the static handler.
+- File names are generated **server-side** as `<epochMs>-<uuid>.<ext>`; the
+  client's file name is discarded, so no path from the client ever reaches
+  the filesystem. The extension comes from the detected image type.
+- Reads need no authentication (matching the public product catalog); writes
+  are admin-only.
+
+### Storing the URL in Firestore
+
+The upload endpoint writes **nothing** to Firestore. Take the returned
+`imageUrl` and send it with the product write — `POST /api/admin/products`
+or `PATCH /api/admin/products/:id` with `{ "imageUrl": "http://localhost:3001/uploads/…" }`.
+Only that URL string plus the product metadata are stored on `products/{id}`;
+**the image bytes and any base64 representation are never written to
+Firestore.**
+
+---
+
+## 7. Not implemented (out of scope)
+
+- **Firebase Storage / cloud image hosting** — the upload endpoint above is
+  local-disk only and must be replaced by Firebase Storage before production
+  use.
 - PayMongo payments (no payment endpoint/webhook; `paymentMethod: "ONLINE"`
   is stored but inert; `paymentStatus` only changes through admin status
   updates).
