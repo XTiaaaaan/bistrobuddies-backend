@@ -91,6 +91,7 @@ describe('createOrder (server-side pricing)', () => {
     expect(summary.subtotal).toBe(200); // 100 x 2 — from product doc
     expect(summary.deliveryFee).toBe(0); // DELIVERY_FEE default
     expect(summary.total).toBe(200);
+    expect(summary.currency).toBe('PHP');
     expect(summary.orderStatus).toBe('PENDING');
     expect(summary.paymentStatus).toBe('PENDING');
 
@@ -134,6 +135,51 @@ describe('createOrder (server-side pricing)', () => {
     body.items[0] = { productId: 'p1', size: 'large', sugar: 'Regular', quantity: 1 };
     const summary = await createOrder({ uid: 'u1', email: null }, body);
     expect(summary.subtotal).toBe(140);
+  });
+
+  it('falls back to the canonical price for single-price products', async () => {
+    const db = makeDb([
+      {
+        id: 'p1',
+        data: {
+          name: 'Bottled Water',
+          imageUrl: '',
+          available: true,
+          sugarOptions: ['Regular'],
+          price: 25,
+          currency: 'PHP',
+        },
+      },
+    ]);
+    vi.mocked(requireFirebase).mockReturnValue({
+      auth: {} as never,
+      db: db as never,
+    });
+
+    const summary = await createOrder({ uid: 'u1', email: null }, request());
+    expect(summary.subtotal).toBe(50); // 25 x 2 — no size tiers stored
+    expect(summary.currency).toBe('PHP');
+
+    const order = db.created[0] as Record<string, unknown>;
+    expect(order['currency']).toBe('PHP');
+    const items = order['items'] as Array<Record<string, unknown>>;
+    expect(items[0]['unitPrice']).toBe(25);
+    expect(items[0]['currency']).toBe('PHP');
+  });
+
+  it('rejects invalid quantities even when request validation is bypassed', async () => {
+    const db = makeDb([{ id: 'p1', data: availableProduct }]);
+    vi.mocked(requireFirebase).mockReturnValue({
+      auth: {} as never,
+      db: db as never,
+    });
+
+    const body = request();
+    body.items[0].quantity = 0;
+    await expect(
+      createOrder({ uid: 'u1', email: null }, body)
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_quantity' });
+    expect(db.created).toHaveLength(0);
   });
 
   it('rejects orders for missing products', async () => {

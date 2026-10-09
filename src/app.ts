@@ -10,6 +10,7 @@ import { adminOrdersRouter } from './routes/admin-orders';
 import { adminProductsRouter } from './routes/admin-products';
 import { healthRouter } from './routes/health';
 import { ordersRouter } from './routes/orders';
+import { productsRouter } from './routes/products';
 
 /**
  * Builds the Express application.
@@ -48,6 +49,7 @@ export function createApp(): Express {
 
   const api = express.Router();
   api.use(healthRouter);
+  api.use(productsRouter);
   api.use(ordersRouter);
   api.use('/admin/products', adminProductsRouter);
   api.use('/admin', adminOrdersRouter);

@@ -326,6 +326,10 @@ export interface ValidatedProductInput {
   category?: string;
   imageUrl?: string;
   cloudinaryPublicId?: string;
+  /** Canonical PHP price (standardized schema). Optional: derived from the
+   * size tiers when omitted, and backfilled into the size tiers when sent
+   * without them. */
+  price?: number;
   smallPrice?: number;
   mediumPrice?: number;
   largePrice?: number;
@@ -333,15 +337,21 @@ export interface ValidatedProductInput {
   available?: boolean;
 }
 
+export const SIZE_PRICE_FIELDS = [
+  'smallPrice',
+  'mediumPrice',
+  'largePrice',
+] as const;
+
+/** `currency` is never accepted from clients — the server always writes PHP. */
 const UPDATABLE_PRODUCT_FIELDS = new Set([
   'name',
   'description',
   'category',
   'imageUrl',
   'cloudinaryPublicId',
-  'smallPrice',
-  'mediumPrice',
-  'largePrice',
+  'price',
+  ...SIZE_PRICE_FIELDS,
   'sugarOptions',
   'available',
 ]);
@@ -413,14 +423,36 @@ export function validateProductInput(
     }
   }
 
-  for (const priceField of ['smallPrice', 'mediumPrice', 'largePrice'] as const) {
-    if (!options.partial || source[priceField] !== undefined) {
-      const price = readNumberField(source, priceField, issues, {
-        required: true,
-      });
-      if (price !== undefined) {
-        result[priceField] = price;
-      }
+  // Canonical PHP price (standardized schema field). Optional on create —
+  // when omitted, the server derives it from the size tiers.
+  const hasCanonicalPrice = source['price'] !== undefined;
+  if (hasCanonicalPrice) {
+    const price = readNumberField(source, 'price', issues, { required: true });
+    if (price !== undefined) {
+      result.price = price;
+    }
+  }
+
+  // Size-tiered prices remain supported (existing clients and products).
+  // On create they are required unless a canonical `price` was supplied, in
+  // which case the server backfills all three tiers from it.
+  for (const priceField of SIZE_PRICE_FIELDS) {
+    const provided = source[priceField] !== undefined;
+    if (!options.partial && !provided && !hasCanonicalPrice) {
+      issues.add(
+        priceField,
+        `${priceField} is required unless price is provided.`
+      );
+      continue;
+    }
+    if (!provided) {
+      continue;
+    }
+    const price = readNumberField(source, priceField, issues, {
+      required: true,
+    });
+    if (price !== undefined) {
+      result[priceField] = price;
     }
   }
 
@@ -473,4 +505,21 @@ export function validateOrderStatus(body: unknown): OrderStatus {
 /** Returns the new status list when `next` is a legal transition from `current`. */
 export function allowedNextStatuses(current: OrderStatus): OrderStatus[] {
   return ORDER_STATUS_TRANSITIONS[current] ?? [];
+}
+
+/** Validates and normalizes a `:id` path parameter for product routes. */
+export function readProductId(raw: string): string {
+  let decoded = raw ?? '';
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Malformed percent-encoding: treat the raw value as the id.
+  }
+  const productId = decoded.trim();
+  if (!productId || productId.length > 128) {
+    throw badRequest('A valid product id is required.', [
+      { field: 'id', message: 'id must be 1-128 characters.' },
+    ]);
+  }
+  return productId;
 }

@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import { badRequest } from '../errors';
-import { validateProductInput } from '../lib/validation';
+import { readProductId, validateProductInput } from '../lib/validation';
 import { requireAdmin, requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
@@ -17,16 +16,6 @@ const adminGuard = [
   requireAuth,
   requireAdmin,
 ];
-
-function readProductId(raw: string): string {
-  const productId = decodeURIComponent(raw ?? '').trim();
-  if (!productId || productId.length > 128) {
-    throw badRequest('A valid product id is required.', [
-      { field: 'id', message: 'id must be 1-128 characters.' },
-    ]);
-  }
-  return productId;
-}
 
 /** POST /api/admin/products — create a product (admin only). */
 adminProductsRouter.post(

@@ -149,6 +149,53 @@ describe('validateProductInput', () => {
     );
   });
 
+  it('accepts the canonical price alongside the size tiers', () => {
+    const result = validateProductInput(
+      { ...fullProduct(), price: 100 },
+      { partial: false }
+    );
+    expect(result.price).toBe(100);
+    expect(result.mediumPrice).toBe(119);
+  });
+
+  it('allows a create payload that only supplies the canonical price', () => {
+    const body = fullProduct() as Record<string, unknown>;
+    delete body['smallPrice'];
+    delete body['mediumPrice'];
+    delete body['largePrice'];
+    body['price'] = 88;
+    const result = validateProductInput(body, { partial: false });
+    expect(result.price).toBe(88);
+    expect(result.smallPrice).toBeUndefined();
+  });
+
+  it('requires the size tiers when no canonical price is provided', () => {
+    const body = fullProduct() as Record<string, unknown>;
+    delete body['largePrice'];
+    expectFieldIssues(
+      () => validateProductInput(body, { partial: false }),
+      /largePrice/
+    );
+  });
+
+  it('rejects a non-positive canonical price', () => {
+    expectFieldIssues(
+      () => validateProductInput({ ...fullProduct(), price: 0 }, { partial: false }),
+      /price/
+    );
+  });
+
+  it('accepts a partial update that only changes the canonical price', () => {
+    const result = validateProductInput({ price: 50 }, { partial: true });
+    expect(result).toEqual({ price: 50 });
+  });
+
+  it('never accepts a client-supplied currency field', () => {
+    expect(() =>
+      validateProductInput({ currency: 'USD' }, { partial: true })
+    ).toThrow(ApiError);
+  });
+
   it('accepts a partial update with only provided fields', () => {
     const result = validateProductInput({ available: false }, { partial: true });
     expect(result).toEqual({ available: false });

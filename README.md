@@ -45,18 +45,33 @@ service-account file or the `.env` file** (both are `.gitignore`d).
 ## API surface
 
 Base path: `/api` (also mounted at `/` for stripped-path serverless hosts).
-Full contract in `../integration-docs/API_CONTRACT.md`.
+Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | GET | `/api/health` | — | Liveness + `firebaseConfigured` flag |
+| GET | `/api/products` | — (public) | Standardized catalog, newest first. 120 req/min/IP |
+| GET | `/api/products/:id` | — (public) | Single product |
 | POST | `/api/orders` | Bearer (customer) | Creates an order; prices/totals computed server-side. 20 req/min/IP |
+| GET | `/api/orders/:id` | Bearer (owner/admin) | Others get 404 (no order id probing). 120 req/min/IP |
 | POST | `/api/admin/products` | Bearer (admin) | Creates a product. 60 req/min/IP |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial product update |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Deletes a product |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status) |
 
 All responses use `{ "error": { "code", "message", "details?" } }` on failure.
+
+### Product schema and currency
+
+Products follow the standardized schema — `name`, `category`, `description`,
+`imageUrl`, `price` (canonical PHP list price), `currency` (always `PHP`),
+`available`, `createdAt`, `updatedAt` — plus the size-tiered
+`smallPrice`/`mediumPrice`/`largePrice` and `sugarOptions` that the existing
+clients' size selector depends on. The canonical `price` is derived from the
+size tiers (or the tiers are backfilled from it) so the two can never drift.
+Clients format amounts with `₱` (`Intl.NumberFormat('en-PH', { style:
+'currency', currency: 'PHP' })`). Historical order prices are snapshots and
+are never rewritten.
 
 ## Security posture
 
@@ -67,8 +82,11 @@ All responses use `{ "error": { "code", "message", "details?" } }` on failure.
 - Firebase ID token verification + server-side admin role check on every
   privileged route (never trusts client-provided uid/role/price)
 - Fixed-window in-memory rate limits (per instance)
-- Firestore rules in this repo were **not** modified — API hardening is
-  defence in depth on top of the existing rules
+- Firestore rules (`firestore.rules`) enforce the same policy for direct
+  client access: public reads on `products` only; `users`/`orders`/`payments`
+  are private; clients cannot create orders/payments or change any status —
+  those writes happen only through this API (Admin SDK). Rules are **not**
+  deployed from this repo; deploy them deliberately with the Firebase CLI.
 
 ## Deployment (untested)
 
@@ -78,4 +96,6 @@ All responses use `{ "error": { "code", "message", "details?" } }` on failure.
 
 ## Environment variables
 
-See `.env.example` and `../integration-docs/ENVIRONMENT_VARIABLES.md`.
+See `.env.example` (names, defaults, and purpose). No secrets are stored in
+this repository; service-account credentials stay in `.env` (git-ignored) or
+in the hosting provider's environment.
