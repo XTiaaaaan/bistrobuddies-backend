@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out-tsc/
+
+# Local environment files and secrets — never commit
+.env
+.env.*
+!.env.example
+serviceAccount*.json
+*service-account*.json
+firebase-admin-credentials*.json
+firebase-service-account*.json
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test / coverage
+coverage/
+
+# Editor and OS files
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Runtime uploads (when the local image-upload endpoint is implemented)
+uploads/
+public/uploads/

@@ -1,0 +1,73 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myUid() {
+      return request.auth.uid;
+    }
+
+    function userDocPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(userDocPath(myUid()))
+        && get(userDocPath(myUid())).data.role == 'admin';
+    }
+
+    // users: a customer may only read/edit their own profile; admins may read all.
+    match /users/{uid} {
+      allow get: if isSignedIn() && (myUid() == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn()
+        && myUid() == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.role == 'customer'
+        && request.resource.data.email == request.auth.token.email;
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && myUid() == uid
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.role == resource.data.role);
+      allow delete: if isAdmin();
+    }
+
+    // products: readable by signed-in users, writable by admins only.
+    match /products/{productId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // orders: customers may read/create only their own orders.
+    // Status and totals may only be changed by admins (or trusted backend).
+    match /orders/{orderId} {
+      allow read: if isSignedIn()
+        && (resource.data.customerId == myUid() || isAdmin());
+      allow create: if isSignedIn()
+        && request.resource.data.customerId == myUid()
+        && request.resource.data.orderStatus == 'PENDING'
+        && request.resource.data.paymentStatus == 'PENDING'
+        && request.resource.data.total
+          == request.resource.data.subtotal + request.resource.data.deliveryFee;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // payments: customers may read/create only their own payment records.
+    // paymentStatus may only be changed by admins or a trusted backend.
+    match /payments/{paymentId} {
+      allow read: if isSignedIn()
+        && (resource.data.customerId == myUid() || isAdmin());
+      allow create: if isSignedIn()
+        && request.resource.data.customerId == myUid()
+        && request.resource.data.status == 'PENDING';
+      allow update, delete: if isAdmin();
+    }
+  }
+}
