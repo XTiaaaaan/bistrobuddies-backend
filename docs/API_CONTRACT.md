@@ -23,7 +23,8 @@ prefix (the router is mounted at both `/api` and `/` for serverless hosts);
 
 Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
 `GET /api/products*` 120/min; `/api/admin/*` 60/min; `POST /api/admin/uploads`
-30/min. Rate-limited responses are `429` with a `Retry-After` header.
+and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
+`Retry-After` header.
 
 ---
 
@@ -40,6 +41,7 @@ Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Delete → `{ id }` |
 | POST | `/api/admin/uploads` | Bearer (admin) | Store a product image on the local disk → `201 { imageUrl, … }` (§6, development only) |
+| POST | `/api/profile/photo` | Bearer (any signed-in user) | Store the caller's profile picture → `201 { imageUrl, … }` (§6, development only) |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Status transition → `{ id, orderStatus }` |
 
 CORS allows `GET, POST, PATCH, DELETE, OPTIONS` from `ALLOWED_ORIGINS`.
@@ -266,6 +268,37 @@ curl -X POST http://localhost:3001/api/admin/uploads \
 `413 file_too_large`, `415 unsupported_media_type`, `429 rate_limited`,
 `503 server_not_configured`.
 
+### POST /api/profile/photo
+
+Customer profile picture upload — identical rules to
+`POST /api/admin/uploads` (multipart field `file`, JPEG/PNG/WebP by magic
+bytes, `UPLOAD_MAX_BYTES` default 5 MB, no other form fields, same error
+codes) with two differences:
+
+| Topic | Rule |
+| --- | --- |
+| Auth | `Authorization: Bearer <any valid ID token>` — `401 unauthorized` without/with a bad token; **no admin role required**, because the picture always belongs to the verified token's uid |
+| Rate limit | 30 requests/min/IP → `429 rate_limited` |
+
+```ts
+const form = new FormData();
+form.append('file', file, file.name); // field name must be "file"
+
+const response = await fetch(`${environment.apiBaseUrl}/profile/photo`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${await user.getIdToken()}` },
+  body: form,
+});
+const { imageUrl } = await response.json(); // 201
+```
+
+The response body has the same shape as the admin upload (`201` with
+`imageUrl`, `path`, `fileName`, `mimeType`, `size`, `uploadedAt`). The
+endpoint writes nothing to Firestore: the mobile app stores the returned
+**URL string** as `users/{uid}.photoUrl` (and mirrors it into the Firebase
+Auth `photoURL`); the image bytes and any base64 representation are never
+written to Firestore.
+
 ### Image URL behaviour
 
 - `imageUrl` is **absolute**, built from `API_BASE_URL` (default
@@ -282,7 +315,8 @@ curl -X POST http://localhost:3001/api/admin/uploads \
   client's file name is discarded, so no path from the client ever reaches
   the filesystem. The extension comes from the detected image type.
 - Reads need no authentication (matching the public product catalog); writes
-  are admin-only.
+  require a Bearer token — admin for product images, any signed-in user for
+  profile photos.
 
 ### Storing the URL in Firestore
 
@@ -297,7 +331,7 @@ Firestore.**
 
 ## 7. Not implemented (out of scope)
 
-- **Firebase Storage / cloud image hosting** — the upload endpoint above is
+- **Firebase Storage / cloud image hosting** — the upload endpoints above are
   local-disk only and must be replaced by Firebase Storage before production
   use.
 - PayMongo payments (no payment endpoint/webhook; `paymentMethod: "ONLINE"`
