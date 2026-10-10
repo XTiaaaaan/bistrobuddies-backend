@@ -57,12 +57,12 @@ Canonical fields — returned by `GET /api/products[/:id]`:
   "category": "Hot",
   "description": "Creamy latte",
   "imageUrl": "assets/products/latte.png",
-  "price": 119,              // canonical PHP list price (derived from the size tiers)
+  "price": 119,              // canonical PHP list price, derived from the size tiers
   "currency": "PHP",         // always "PHP" — clients format it as ₱
   "available": true,
   "createdAt": "2026-10-09T12:00:00.000Z",  // null when never set
   "updatedAt": "2026-10-09T12:00:00.000Z",
-  // Size-tiered prices kept for the existing size selector / cart logic:
+  // Canonical size prices — what each size actually costs:
   "smallPrice": 99,
   "mediumPrice": 119,
   "largePrice": 139,
@@ -73,19 +73,50 @@ Canonical fields — returned by `GET /api/products[/:id]`:
 
 ### Write payloads (admin API)
 
+**Size prices are canonical.** `smallPrice`, `mediumPrice` and `largePrice`
+are the source of truth for what a customer pays per size; the legacy `price`
+is still accepted for older clients, but it can never replace the three size
+prices. Every price must be a finite PHP amount **greater than 0** with at
+most two decimals (values are normalized to centavos, e.g. `99.999` → `100`,
+`0.001` → `400`).
+
 - **Create** (`POST`): `name`, `category`, `description`, `imageUrl`,
   `sugarOptions`, `available` required as before, **plus price input — either**
-  the canonical `price` **or** all three size prices (`smallPrice`,
-  `mediumPrice`, `largePrice`). Sending `price` alone makes the server
-  backfill all three tiers with that amount (flat pricing).
+  the three size prices (recommended) **or** the legacy `price`.
+  - three size prices supplied → stored exactly as sent (100/120/150 stay
+    distinct even when a legacy `price` is present); canonical `price` is
+    re-derived from the medium tier,
+  - only `price` supplied → flat pricing: that amount is written to all three
+    tiers so size-selector clients keep working.
 - **Update** (`PATCH`): any subset of the same fields + `price`.
-  - size tier(s) provided → canonical `price` is re-derived
-    (medium → small → large),
-  - only `price` provided → all three tiers are backfilled to it,
+  - size tier(s) provided → those tiers are written and canonical `price` is
+    re-derived (medium → small → large),
+  - only `price` provided on a product that **already has size tiers** → the
+    stored tiers are left untouched (a single legacy price can no longer
+    flatten a tiered product) and `price` is re-derived from them,
+  - only `price` provided on a legacy record with **no size tiers** → the
+    tiers are materialized from that price so the mobile size selector keeps
+    working,
   - `currency` is **never** accepted from clients (server always writes `PHP`).
-- Legacy documents without `price` are normalized (`price` + `currency`
-  written back) the first time they are edited. **No migration is run and no
-  stored product or historical order is rewritten by reads.**
+- Legacy documents are normalized (`price` + `currency`, plus materialized
+  tiers for flat records) the first time they are edited. **No migration is
+  run and no stored product or historical order is rewritten by reads.**
+
+### Migrating legacy products to the standard size prices
+
+Older records that only carry a flat `price` are never rewritten by reads and
+are never flattened by an admin save. To put a product on the standard coffee
+prices, PATCH the three tiers explicitly:
+
+```bash
+curl -X PATCH http://localhost:3001/api/admin/products/<id> \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "smallPrice": 100, "mediumPrice": 120, "largePrice": 150 }'
+```
+
+The canonical `price` is then re-derived server-side (medium → `120`).
+Existing orders are historical snapshots and are never touched.
 
 ### ₱ formatting (clients)
 

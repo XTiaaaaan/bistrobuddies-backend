@@ -122,7 +122,7 @@ const AVAILABLE_PRODUCT: Record<string, unknown> = {
   sugarOptions: ['Regular'],
   smallPrice: 100,
   mediumPrice: 120,
-  largePrice: 140,
+  largePrice: 150,
 };
 
 function orderBody(overrides: Record<string, unknown> = {}) {
@@ -339,6 +339,59 @@ describe('bistrobuddies-backend HTTP API', () => {
       expect(items[0]['unitPrice']).toBe(100);
     });
 
+    it('prices each size from its own server-side tier (100/120/150)', async () => {
+      const response = await fetch(`${base}/api/orders`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid-customer',
+        },
+        body: JSON.stringify(
+          orderBody({
+            items: [
+              { productId: 'p1', size: 'small', sugar: 'Regular', quantity: 1 },
+              { productId: 'p1', size: 'medium', sugar: 'Regular', quantity: 1 },
+              { productId: 'p1', size: 'large', sugar: 'Regular', quantity: 1 },
+            ],
+          })
+        ),
+      });
+      expect(response.status).toBe(201);
+      const summary = (await response.json()) as Record<string, unknown>;
+      expect(summary['subtotal']).toBe(370); // 100 + 120 + 150
+      expect(summary['total']).toBe(370);
+
+      const order = state.store.createdOrders[0];
+      const items = order['items'] as Array<Record<string, unknown>>;
+      expect(items.map((item) => item['unitPrice'])).toEqual([100, 120, 150]);
+      expect(items.map((item) => item['subtotal'])).toEqual([100, 120, 150]);
+    });
+
+    it('ignores unit prices and totals submitted by the customer', async () => {
+      const body = orderBody() as Record<string, unknown>;
+      body['total'] = 1;
+      body['subtotal'] = 1;
+      (body['items'] as Array<Record<string, unknown>>)[0]['unitPrice'] = 1;
+
+      const response = await fetch(`${base}/api/orders`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid-customer',
+        },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(201);
+      const summary = (await response.json()) as Record<string, unknown>;
+      expect(summary['subtotal']).toBe(200); // server-side 100 x 2
+      expect(summary['total']).toBe(200);
+
+      const order = state.store.createdOrders[0];
+      const items = order['items'] as Array<Record<string, unknown>>;
+      expect(items[0]['unitPrice']).toBe(100);
+      expect(items[0]['subtotal']).toBe(200);
+    });
+
     it('prices a standardized single-price product from the server record', async () => {
       state.store.products.set('single', {
         name: 'Bottled Water',
@@ -445,6 +498,26 @@ describe('bistrobuddies-backend HTTP API', () => {
       expect(created['largePrice']).toBe(139);
     });
 
+    it('keeps distinct size prices on create (100/120/150)', async () => {
+      const response = await post(
+        '/api/admin/products',
+        'valid-admin',
+        productBody({
+          smallPrice: 100,
+          mediumPrice: 120,
+          largePrice: 150,
+          price: 100,
+        })
+      );
+      expect(response.status).toBe(201);
+      const created = state.store.createdProducts[0];
+      expect(created['smallPrice']).toBe(100);
+      expect(created['mediumPrice']).toBe(120);
+      expect(created['largePrice']).toBe(150);
+      expect(created['price']).toBe(120);
+      expect(created['currency']).toBe('PHP');
+    });
+
     it('creates a single-price product from `price` alone', async () => {
       const body = productBody({ price: 88 });
       delete body['smallPrice'];
@@ -504,7 +577,7 @@ describe('bistrobuddies-backend HTTP API', () => {
       expect(patch['currency']).toBe('PHP');
     });
 
-    it('backfills size tiers when only the canonical price is patched', async () => {
+    it('never replaces stored size tiers with a single legacy price', async () => {
       const response = await fetch(`${base}/api/admin/products/p1`, {
         method: 'PATCH',
         headers: {
@@ -515,10 +588,35 @@ describe('bistrobuddies-backend HTTP API', () => {
       });
       expect(response.status).toBe(200);
       const patch = state.store.updatedProducts[0].patch;
-      expect(patch['price']).toBe(150);
-      expect(patch['smallPrice']).toBe(150);
-      expect(patch['mediumPrice']).toBe(150);
+      // The three canonical prices stay exactly as stored (100/120/150)…
+      expect(patch['smallPrice']).toBeUndefined();
+      expect(patch['mediumPrice']).toBeUndefined();
+      expect(patch['largePrice']).toBeUndefined();
+      // …and the canonical price is re-derived from the medium size tier.
+      expect(patch['price']).toBe(120);
+      expect(patch['currency']).toBe('PHP');
+    });
+
+    it('stores the three supplied size prices unchanged (100/120/150)', async () => {
+      const response = await fetch(`${base}/api/admin/products/p1`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid-admin',
+        },
+        body: JSON.stringify({
+          smallPrice: 100,
+          mediumPrice: 120,
+          largePrice: 150,
+          price: 100,
+        }),
+      });
+      expect(response.status).toBe(200);
+      const patch = state.store.updatedProducts[0].patch;
+      expect(patch['smallPrice']).toBe(100);
+      expect(patch['mediumPrice']).toBe(120);
       expect(patch['largePrice']).toBe(150);
+      expect(patch['price']).toBe(120);
     });
 
     it('returns 404 when patching a missing product', async () => {
@@ -584,6 +682,17 @@ describe('bistrobuddies-backend HTTP API', () => {
       expect(product['smallPrice']).toBe(100);
       expect(product['available']).toBe(true);
       expect(product['sugarOptions']).toEqual(['Regular']);
+    });
+
+    it('returns all three size prices distinctly', async () => {
+      const response = await fetch(`${base}/api/products/p1`);
+      expect(response.status).toBe(200);
+      const product = (await response.json()) as Record<string, unknown>;
+      expect(product['smallPrice']).toBe(100);
+      expect(product['mediumPrice']).toBe(120);
+      expect(product['largePrice']).toBe(150);
+      expect(product['price']).toBe(120); // canonical price = medium tier
+      expect(product['currency']).toBe('PHP');
     });
 
     it('returns a single product without authentication', async () => {

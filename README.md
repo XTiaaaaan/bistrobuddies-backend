@@ -69,11 +69,17 @@ Products follow the standardized schema — `name`, `category`, `description`,
 `imageUrl`, `price` (canonical PHP list price), `currency` (always `PHP`),
 `available`, `createdAt`, `updatedAt` — plus the size-tiered
 `smallPrice`/`mediumPrice`/`largePrice` and `sugarOptions` that the existing
-clients' size selector depends on. The canonical `price` is derived from the
-size tiers (or the tiers are backfilled from it) so the two can never drift.
-Clients format amounts with `₱` (`Intl.NumberFormat('en-PH', { style:
-'currency', currency: 'PHP' })`). Historical order prices are snapshots and
-are never rewritten.
+clients' size selector depends on. The three size prices are canonical: they
+are stored exactly as the admin sends them (100/120/150 stay distinct), and
+the canonical `price` is derived from them (medium → small → large) so the two
+can never drift. The legacy single `price` field is still accepted, but it only
+fills in size tiers for products that have none — it never overwrites existing
+size prices. Customers never send prices: order totals are recomputed
+server-side from these records. Clients format amounts with `₱`
+(`Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' })`).
+Historical order prices are snapshots and are never rewritten; legacy flat
+products are migrated by PATCHing the three size prices explicitly (see
+`docs/API_CONTRACT.md` § "Migrating legacy products").
 
 ## Local image uploads (development only)
 
