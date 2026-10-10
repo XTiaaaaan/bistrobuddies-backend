@@ -13,6 +13,8 @@ serviceAccount*.json
 *service-account*.json
 firebase-admin-credentials*.json
 firebase-service-account*.json
+# Firebase Console downloads keys as <project>-firebase-adminsdk-<hash>.json
+*-firebase-adminsdk-*.json
 *.pem
 *.key
 
