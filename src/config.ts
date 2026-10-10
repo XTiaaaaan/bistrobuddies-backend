@@ -51,6 +51,7 @@ function readBoolean(name: string, fallback: boolean): boolean {
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:4200',
   'http://localhost:8100',
+  'http://localhost:8101',
   'capacitor://localhost',
   'https://localhost',
 ];
