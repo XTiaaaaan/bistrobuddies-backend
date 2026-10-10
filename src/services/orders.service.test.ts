@@ -54,7 +54,7 @@ const availableProduct = {
   sugarOptions: ['No Sugar', 'Regular'],
   smallPrice: 100,
   mediumPrice: 120,
-  largePrice: 140,
+  largePrice: 150,
 };
 
 function request() {
@@ -134,7 +134,58 @@ describe('createOrder (server-side pricing)', () => {
     const body = request();
     body.items[0] = { productId: 'p1', size: 'large', sugar: 'Regular', quantity: 1 };
     const summary = await createOrder({ uid: 'u1', email: null }, body);
-    expect(summary.subtotal).toBe(140);
+    expect(summary.subtotal).toBe(150);
+  });
+
+  it('uses 100/120/150 for small/medium/large in the same order', async () => {
+    const db = makeDb([{ id: 'p1', data: availableProduct }]);
+    vi.mocked(requireFirebase).mockReturnValue({
+      auth: {} as never,
+      db: db as never,
+    });
+
+    const body = request();
+    body.items = [
+      { productId: 'p1', size: 'small', sugar: 'Regular', quantity: 1 },
+      { productId: 'p1', size: 'medium', sugar: 'Regular', quantity: 1 },
+      { productId: 'p1', size: 'large', sugar: 'Regular', quantity: 1 },
+    ];
+    const summary = await createOrder({ uid: 'u1', email: null }, body);
+    expect(summary.subtotal).toBe(370); // 100 + 120 + 150
+    expect(summary.total).toBe(370);
+
+    const order = db.created[0] as Record<string, unknown>;
+    const items = order['items'] as Array<Record<string, unknown>>;
+    expect(items.map((item) => item['unitPrice'])).toEqual([100, 120, 150]);
+    expect(items.map((item) => item['size'])).toEqual([
+      'small',
+      'medium',
+      'large',
+    ]);
+  });
+
+  it('ignores unit prices and totals submitted by the customer', async () => {
+    const db = makeDb([{ id: 'p1', data: availableProduct }]);
+    vi.mocked(requireFirebase).mockReturnValue({
+      auth: {} as never,
+      db: db as never,
+    });
+
+    const body = request();
+    const raw = body as unknown as Record<string, unknown>;
+    raw['total'] = 1;
+    raw['subtotal'] = 1;
+    (body.items[0] as unknown as Record<string, unknown>)['unitPrice'] = 1;
+    (body.items[0] as unknown as Record<string, unknown>)['subtotal'] = 1;
+
+    const summary = await createOrder({ uid: 'u1', email: null }, body);
+    expect(summary.subtotal).toBe(200); // server-side 100 x 2
+    expect(summary.total).toBe(200);
+
+    const order = db.created[0] as Record<string, unknown>;
+    const items = order['items'] as Array<Record<string, unknown>>;
+    expect(items[0]['unitPrice']).toBe(100);
+    expect(items[0]['subtotal']).toBe(200);
   });
 
   it('falls back to the canonical price for single-price products', async () => {

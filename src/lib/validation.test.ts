@@ -131,12 +131,77 @@ describe('validateProductInput', () => {
     );
   });
 
+  it('keeps the three canonical size prices distinct (100/120/150)', () => {
+    const result = validateProductInput(
+      { ...fullProduct(), smallPrice: 100, mediumPrice: 120, largePrice: 150 },
+      { partial: false }
+    );
+    expect(result.smallPrice).toBe(100);
+    expect(result.mediumPrice).toBe(120);
+    expect(result.largePrice).toBe(150);
+    // The three tiers are never flattened into one another.
+    expect(new Set([result.smallPrice, result.mediumPrice, result.largePrice]).size).toBe(3);
+  });
+
+  it('accepts the three size prices alongside a legacy price without flattening', () => {
+    const result = validateProductInput(
+      {
+        ...fullProduct(),
+        price: 100,
+        smallPrice: 100,
+        mediumPrice: 120,
+        largePrice: 150,
+      },
+      { partial: false }
+    );
+    expect(result.price).toBe(100);
+    expect(result.smallPrice).toBe(100);
+    expect(result.mediumPrice).toBe(120);
+    expect(result.largePrice).toBe(150);
+  });
+
   it('rejects non-positive prices', () => {
     const body = fullProduct();
     body.smallPrice = 0;
     expectFieldIssues(
       () => validateProductInput(body, { partial: false }),
       /greater than 0/
+    );
+  });
+
+  it('rejects a non-positive medium price', () => {
+    const body = fullProduct();
+    body.mediumPrice = -1;
+    expectFieldIssues(
+      () => validateProductInput(body, { partial: false }),
+      /mediumPrice/
+    );
+  });
+
+  it('rejects a non-positive large price', () => {
+    const body = fullProduct();
+    body.largePrice = 0;
+    expectFieldIssues(
+      () => validateProductInput(body, { partial: false }),
+      /largePrice/
+    );
+  });
+
+  it('normalizes size prices to two-decimal precision', () => {
+    const result = validateProductInput(
+      { ...fullProduct(), smallPrice: 99.999, mediumPrice: 120.001, largePrice: 149.995 },
+      { partial: false }
+    );
+    expect(result.smallPrice).toBe(100);
+    expect(result.mediumPrice).toBe(120);
+    expect(result.largePrice).toBe(150);
+  });
+
+  it('rejects a price that rounds below one centavo', () => {
+    expectFieldIssues(
+      () =>
+        validateProductInput({ ...fullProduct(), smallPrice: 0.001 }, { partial: false }),
+      /at least 0.01/
     );
   });
 
@@ -188,6 +253,18 @@ describe('validateProductInput', () => {
   it('accepts a partial update that only changes the canonical price', () => {
     const result = validateProductInput({ price: 50 }, { partial: true });
     expect(result).toEqual({ price: 50 });
+  });
+
+  it('accepts a partial update that only changes the three size prices', () => {
+    const result = validateProductInput(
+      { smallPrice: 100, mediumPrice: 120, largePrice: 150 },
+      { partial: true }
+    );
+    expect(result).toEqual({
+      smallPrice: 100,
+      mediumPrice: 120,
+      largePrice: 150,
+    });
   });
 
   it('never accepts a client-supplied currency field', () => {

@@ -57,6 +57,15 @@ function derivePrice(record: PriceRecord): number | null {
  * The written document shape matches the standardized product schema:
  * name, category, description, imageUrl, price, currency, available,
  * createdAt, updatedAt (plus the size tiers used by existing clients).
+ *
+ * Pricing rules:
+ * - `smallPrice`/`mediumPrice`/`largePrice` are the canonical size prices.
+ *   Whatever the caller supplies for them is stored unchanged, so three
+ *   distinct amounts (e.g. 100/120/150) stay distinct.
+ * - The legacy `price` only fills the size tiers in when the product has no
+ *   tiers at all (flat pricing); it never replaces stored or supplied tiers.
+ * - The stored `price` is always re-derived from the tiers (medium → small →
+ *   large → price) so the canonical price cannot drift from what is charged.
  */
 export async function createProduct(
   input: ValidatedProductInput
@@ -64,9 +73,10 @@ export async function createProduct(
   const { db } = requireFirebase();
 
   const productRef = db.collection('products').doc();
-  // Validation guarantees at least one positive price source (canonical
-  // `price` or the three size tiers); the missing side is backfilled so the
-  // stored document is always coherent for every client.
+  // Validation guarantees at least one positive price source (the three size
+  // tiers, or the legacy `price` when an older client sends only that). The
+  // missing side is backfilled so the stored document is always coherent for
+  // every client. Supplied size tiers always win over the legacy `price`.
   const smallPrice = input.smallPrice ?? input.price ?? 0;
   const mediumPrice = input.mediumPrice ?? input.price ?? 0;
   const largePrice = input.largePrice ?? input.price ?? 0;
@@ -113,20 +123,30 @@ export async function updateProduct(
   // Currency is server-owned: always PHP, never taken from the request.
   delete patch['currency'];
 
+  const existing = (snapshot.data() ?? {}) as PriceRecord;
   const tiersProvided = SIZE_PRICE_FIELDS.some(
     (field) => patch[field] !== undefined
   );
-  if (input.price !== undefined && !tiersProvided) {
-    // A canonical price without tiers means "flat pricing": backfill the
-    // tiers so size-selector clients keep working with the same amount.
-    patch['smallPrice'] = input.price;
-    patch['mediumPrice'] = input.price;
-    patch['largePrice'] = input.price;
+  const storedTiers = SIZE_PRICE_FIELDS.some((field) =>
+    isPositivePrice(existing[field])
+  );
+  if (!tiersProvided && !storedTiers) {
+    // Legacy flat record (a single `price`, no size tiers): materialize the
+    // tiers from that price so size-selector clients keep working. Products
+    // that already carry size tiers are never flattened by a legacy `price`.
+    const flatPrice = resolvePrice([patch['price'], existing['price']]);
+    if (flatPrice !== null) {
+      for (const field of SIZE_PRICE_FIELDS) {
+        patch[field] = flatPrice;
+      }
+    }
   }
 
-  // Keep `price` in sync with the (possibly merged) size tiers. Existing
-  // documents without a `price` are normalized the first time they are edited.
-  const merged: PriceRecord = { ...snapshot.data(), ...patch };
+  // Keep `price` in sync with the (possibly merged) size tiers. The size
+  // tiers win, so a legacy `price` in the payload can never replace the
+  // three canonical prices. Existing documents without a `price` are
+  // normalized the first time they are edited.
+  const merged: PriceRecord = { ...existing, ...patch };
   const derived = derivePrice(merged);
   if (derived !== null) {
     patch['price'] = derived;

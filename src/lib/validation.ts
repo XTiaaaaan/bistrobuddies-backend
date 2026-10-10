@@ -1,4 +1,5 @@
 import { FieldIssue, badRequest } from '../errors';
+import { roundMoney } from './money';
 
 export type ProductSize = 'small' | 'medium' | 'large';
 export type PaymentMethod = 'COD' | 'ONLINE';
@@ -159,6 +160,30 @@ function readNumberField(
     return undefined;
   }
   return value;
+}
+
+/**
+ * Reads a PHP price field with the project's existing price rules (a finite
+ * number greater than 0) and normalizes it to two-decimal precision using the
+ * same `roundMoney` convention the order totals use, so every stored size
+ * price is a valid centavo amount (`99.999` → `100`, `0.001` → rejected).
+ */
+function readPriceField(
+  source: Record<string, unknown>,
+  field: string,
+  issues: Issues,
+  options: { required?: boolean }
+): number | undefined {
+  const value = readNumberField(source, field, issues, options);
+  if (value === undefined) {
+    return undefined;
+  }
+  const rounded = roundMoney(value);
+  if (rounded <= 0) {
+    issues.add(field, `${field} must be at least 0.01.`);
+    return undefined;
+  }
+  return rounded;
 }
 
 function readBooleanField(
@@ -326,10 +351,13 @@ export interface ValidatedProductInput {
   category?: string;
   imageUrl?: string;
   cloudinaryPublicId?: string;
-  /** Canonical PHP price (standardized schema). Optional: derived from the
-   * size tiers when omitted, and backfilled into the size tiers when sent
-   * without them. */
+  /**
+   * Legacy single PHP price, still accepted so older admin clients keep
+   * working. The size tiers below are the canonical prices: `price` is never
+   * allowed to replace them, it is re-derived from them server-side.
+   */
   price?: number;
+  /** Canonical PHP size prices — the source of truth for what each size costs. */
   smallPrice?: number;
   mediumPrice?: number;
   largePrice?: number;
@@ -423,19 +451,22 @@ export function validateProductInput(
     }
   }
 
-  // Canonical PHP price (standardized schema field). Optional on create —
-  // when omitted, the server derives it from the size tiers.
+  // Legacy single price. Optional on create — when it is the only price
+  // supplied, the server writes flat pricing (all three size tiers) so
+  // size-selector clients keep working. It never overwrites size tiers that
+  // are supplied in the same payload or already stored on the product.
   const hasCanonicalPrice = source['price'] !== undefined;
   if (hasCanonicalPrice) {
-    const price = readNumberField(source, 'price', issues, { required: true });
+    const price = readPriceField(source, 'price', issues, { required: true });
     if (price !== undefined) {
       result.price = price;
     }
   }
 
-  // Size-tiered prices remain supported (existing clients and products).
-  // On create they are required unless a canonical `price` was supplied, in
-  // which case the server backfills all three tiers from it.
+  // Canonical size prices: small/medium/large are what a customer pays per
+  // size. On create they are required unless the legacy `price` was supplied
+  // (flat pricing); on update only the provided tiers change and the stored
+  // tiers are never replaced by a single legacy `price`.
   for (const priceField of SIZE_PRICE_FIELDS) {
     const provided = source[priceField] !== undefined;
     if (!options.partial && !provided && !hasCanonicalPrice) {
@@ -448,7 +479,7 @@ export function validateProductInput(
     if (!provided) {
       continue;
     }
-    const price = readNumberField(source, priceField, issues, {
+    const price = readPriceField(source, priceField, issues, {
       required: true,
     });
     if (price !== undefined) {

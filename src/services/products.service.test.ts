@@ -128,6 +128,25 @@ describe('products.service writes (standardized schema)', () => {
     expect(payload['updatedAt']).toBeDefined();
   });
 
+  it('keeps three distinct size prices (100/120/150) on create', async () => {
+    const store = mockWith({});
+    await createProduct(
+      createInput({
+        smallPrice: 100,
+        mediumPrice: 120,
+        largePrice: 150,
+        // A stale legacy price must not flatten the size tiers.
+        price: 100,
+      })
+    );
+    const payload = store.created[0];
+    expect(payload['smallPrice']).toBe(100);
+    expect(payload['mediumPrice']).toBe(120);
+    expect(payload['largePrice']).toBe(150);
+    expect(payload['price']).toBe(120); // derived from the medium tier
+    expect(payload['currency']).toBe('PHP');
+  });
+
   it('backfills size tiers when creating from a single canonical price', async () => {
     const store = mockWith({});
     await createProduct(
@@ -157,14 +176,50 @@ describe('products.service writes (standardized schema)', () => {
     expect(patch['createdAt']).toBeUndefined();
   });
 
-  it('backfills all size tiers when only the canonical price is patched', async () => {
+  it('never replaces stored size tiers with a single legacy price', async () => {
     const store = mockWith({ p1: legacyProduct });
     await updateProduct('p1', { price: 150 });
     const { patch } = store.updated[0];
-    expect(patch['price']).toBe(150);
-    expect(patch['smallPrice']).toBe(150);
-    expect(patch['mediumPrice']).toBe(150);
+    expect(patch['smallPrice']).toBeUndefined();
+    expect(patch['mediumPrice']).toBeUndefined();
+    expect(patch['largePrice']).toBeUndefined();
+    // Canonical price re-derived from the stored medium tier, not from 150.
+    expect(patch['price']).toBe(119);
+  });
+
+  it('writes the three supplied size prices on update (100/120/150)', async () => {
+    const store = mockWith({ p1: legacyProduct });
+    await updateProduct('p1', {
+      smallPrice: 100,
+      mediumPrice: 120,
+      largePrice: 150,
+      price: 100,
+    });
+    const { patch } = store.updated[0];
+    expect(patch['smallPrice']).toBe(100);
+    expect(patch['mediumPrice']).toBe(120);
     expect(patch['largePrice']).toBe(150);
+    expect(patch['price']).toBe(120);
+  });
+
+  it('materializes size tiers for a legacy record that only has a price', async () => {
+    const store = mockWith({
+      p1: {
+        name: 'Bottled Water',
+        description: '500ml',
+        category: 'Drinks',
+        imageUrl: '',
+        price: 25,
+        sugarOptions: ['Regular'],
+        available: true,
+      },
+    });
+    await updateProduct('p1', { price: 30 });
+    const { patch } = store.updated[0];
+    expect(patch['price']).toBe(30);
+    expect(patch['smallPrice']).toBe(30);
+    expect(patch['mediumPrice']).toBe(30);
+    expect(patch['largePrice']).toBe(30);
   });
 
   it('normalizes legacy documents on any update (price + currency)', async () => {
@@ -202,6 +257,20 @@ describe('products.service reads (public catalog)', () => {
       createdAt: null,
       updatedAt: null,
     });
+  });
+
+  it('returns all three size prices distinctly in the API payload', () => {
+    const product = serializeProduct('p1', {
+      ...legacyProduct,
+      smallPrice: 100,
+      mediumPrice: 120,
+      largePrice: 150,
+    });
+    expect(product.smallPrice).toBe(100);
+    expect(product.mediumPrice).toBe(120);
+    expect(product.largePrice).toBe(150);
+    expect(product.price).toBe(120);
+    expect(product.currency).toBe('PHP');
   });
 
   it('lists products newest-first with standardized fields', async () => {
