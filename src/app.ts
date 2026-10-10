@@ -14,6 +14,7 @@ import { adminUploadsRouter } from './routes/admin-uploads';
 import { healthRouter } from './routes/health';
 import { ordersRouter } from './routes/orders';
 import { productsRouter } from './routes/products';
+import { profileUploadsRouter } from './routes/profile-uploads';
 
 /**
  * Builds the Express application.
@@ -57,6 +58,7 @@ export function createApp(): Express {
   api.use('/admin/products', adminProductsRouter);
   api.use('/admin/uploads', adminUploadsRouter);
   api.use('/admin', adminOrdersRouter);
+  api.use('/profile', profileUploadsRouter);
 
   app.use('/api', api);
   app.use('/', api);
