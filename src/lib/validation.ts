@@ -521,6 +521,200 @@ export function validateProductInput(
   return result;
 }
 
+export interface ContactMessageInput {
+  name: string;
+  email: string;
+  subject: string;
+  message: string;
+}
+
+/** Maximum accepted lengths for the Contact Us form fields. */
+export const CONTACT_NAME_MAX = 120;
+export const CONTACT_EMAIL_MAX = 254;
+export const CONTACT_SUBJECT_MAX = 150;
+export const CONTACT_MESSAGE_MAX = 2000;
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Validates the POST /api/contact-messages request body.
+ *
+ * Values are trimmed and rejected when empty/whitespace-only or longer than
+ * the limits above; `email` must additionally look like an email address.
+ * Only these four fields are read — any other client-supplied properties
+ * (e.g. `userId`, `status`, timestamps) are ignored and never trusted.
+ */
+export function validateContactMessageRequest(body: unknown): ContactMessageInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const name = readString(source, 'name', issues, {
+    required: true,
+    max: CONTACT_NAME_MAX,
+  });
+  const email = readString(source, 'email', issues, {
+    required: true,
+    max: CONTACT_EMAIL_MAX,
+  });
+  if (email !== undefined && !EMAIL_PATTERN.test(email)) {
+    issues.add('email', 'email must be a valid email address.');
+  }
+  const subject = readString(source, 'subject', issues, {
+    required: true,
+    max: CONTACT_SUBJECT_MAX,
+  });
+  const message = readString(source, 'message', issues, {
+    required: true,
+    max: CONTACT_MESSAGE_MAX,
+  });
+
+  issues.throwIfAny('The contact message payload is invalid.');
+
+  return {
+    name: name ?? '',
+    email: email ?? '',
+    subject: subject ?? '',
+    message: message ?? '',
+  };
+}
+
+export type ContactMessageStatus = 'NEW' | 'READ' | 'RESOLVED';
+
+/** Workflow statuses a stored contact message can carry. */
+export const CONTACT_MESSAGE_STATUSES: ContactMessageStatus[] = [
+  'NEW',
+  'READ',
+  'RESOLVED',
+];
+
+/**
+ * Statuses the admin API accepts on an update. `NEW` is the server-assigned
+ * initial status only — an administrator moves messages forward to READ or
+ * RESOLVED, never back to NEW.
+ */
+export const CONTACT_MESSAGE_UPDATABLE_STATUSES: ContactMessageStatus[] = [
+  'READ',
+  'RESOLVED',
+];
+
+export const CONTACT_MESSAGES_DEFAULT_PAGE_SIZE = 25;
+export const CONTACT_MESSAGES_MAX_PAGE_SIZE = 100;
+
+/** Validates PATCH /api/admin/contact-messages/:id/status body. */
+export function validateContactMessageStatusUpdate(
+  body: unknown
+): ContactMessageStatus {
+  const source = asObject(body);
+  const raw = source['status'];
+  if (
+    typeof raw !== 'string' ||
+    !CONTACT_MESSAGE_UPDATABLE_STATUSES.includes(raw as ContactMessageStatus)
+  ) {
+    throw badRequest(
+      `status must be one of: ${CONTACT_MESSAGE_UPDATABLE_STATUSES.join(', ')}.`
+    );
+  }
+  return raw as ContactMessageStatus;
+}
+
+export interface ContactMessageListQuery {
+  page: number;
+  pageSize: number;
+  status?: ContactMessageStatus;
+}
+
+/** Parses a query-string value into a positive integer, or null when invalid. */
+function readPositiveInteger(raw: unknown): number | null {
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    return null;
+  }
+  const value = typeof raw === 'string' ? Number(raw) : raw;
+  if (!Number.isInteger(value) || value < 1) {
+    return null;
+  }
+  return value;
+}
+
+/**
+ * Validates GET /api/admin/contact-messages query parameters.
+ *
+ * `status` (optional) must be a known workflow status; `page` and `pageSize`
+ * (optional) must be positive integers with `pageSize` capped at
+ * CONTACT_MESSAGES_MAX_PAGE_SIZE so a single request can never ask Firestore
+ * for an unbounded page.
+ */
+export function readContactMessageListQuery(
+  query: Record<string, unknown>
+): ContactMessageListQuery {
+  const issues = new Issues();
+  let page = 1;
+  let pageSize = CONTACT_MESSAGES_DEFAULT_PAGE_SIZE;
+  let status: ContactMessageStatus | undefined;
+
+  const statusRaw = query['status'];
+  if (statusRaw !== undefined && statusRaw !== null && statusRaw !== '') {
+    if (
+      typeof statusRaw !== 'string' ||
+      !CONTACT_MESSAGE_STATUSES.includes(statusRaw as ContactMessageStatus)
+    ) {
+      issues.add(
+        'status',
+        `status must be one of: ${CONTACT_MESSAGE_STATUSES.join(', ')}.`
+      );
+    } else {
+      status = statusRaw as ContactMessageStatus;
+    }
+  }
+
+  const pageRaw = query['page'];
+  if (pageRaw !== undefined && pageRaw !== null && pageRaw !== '') {
+    const parsed = readPositiveInteger(pageRaw);
+    if (parsed === null) {
+      issues.add('page', 'page must be a positive integer.');
+    } else {
+      page = parsed;
+    }
+  }
+
+  const pageSizeRaw = query['pageSize'];
+  if (pageSizeRaw !== undefined && pageSizeRaw !== null && pageSizeRaw !== '') {
+    const parsed = readPositiveInteger(pageSizeRaw);
+    if (parsed === null || parsed > CONTACT_MESSAGES_MAX_PAGE_SIZE) {
+      issues.add(
+        'pageSize',
+        `pageSize must be an integer between 1 and ${CONTACT_MESSAGES_MAX_PAGE_SIZE}.`
+      );
+    } else {
+      pageSize = parsed;
+    }
+  }
+
+  issues.throwIfAny('The contact message query is invalid.');
+
+  return {
+    page,
+    pageSize,
+    ...(status !== undefined ? { status } : {}),
+  };
+}
+
+/** Validates and normalizes a `:id` path parameter for contact message routes. */
+export function readContactMessageId(raw: string): string {
+  let decoded = raw ?? '';
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Malformed percent-encoding: treat the raw value as the id.
+  }
+  const messageId = decoded.trim();
+  if (!messageId || messageId.length > 128) {
+    throw badRequest('A valid message id is required.', [
+      { field: 'id', message: 'id must be 1-128 characters.' },
+    ]);
+  }
+  return messageId;
+}
+
 /** Validates POST /api/admin/orders/:id/status body. */
 export function validateOrderStatus(body: unknown): OrderStatus {
   const source = asObject(body);

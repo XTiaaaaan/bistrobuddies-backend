@@ -312,3 +312,22 @@ enable the **IAM Credentials API** for project `12668682749`
 (`https://console.developers.google.com/apis/api/iamcredentials.googleapis.com/overview?project=12668682749`)
 so an automated custom-token sign-in can be minted. The IAM API is **not**
 used by this backend — only `createCustomToken` (test tooling) needs it.
+
+---
+
+## 13. Addendum — Contact Us messages (added after this audit)
+
+Implemented in `bistrobuddies-backend` only; nothing was deployed.
+
+| Piece | Where |
+|---|---|
+| Endpoint | `POST /api/contact-messages` (`src/routes/contact-messages.ts`), guards `[rateLimit 10/min/IP, requireAuth]` — any signed-in customer, matching the app's other customer write endpoints; `userId` from the verified token only |
+| Validation | `validateContactMessageRequest` (`src/lib/validation.ts`) — `name` ≤120, `email` ≤254 + format check, `subject` ≤150, `message` ≤2000; all trimmed, empty/whitespace-only rejected with `400 invalid_request` + field details; only these four fields are read |
+| Storage | Firestore `contactMessages` (`src/services/contact-messages.service.ts`) — server-generated doc id, `status: 'NEW'`, `createdAt`/`updatedAt` server timestamps; `201 { id, status }` only after the write resolves, `500` on storage failure |
+| Firestore rules | New `match /contactMessages/{messageId} { allow read, write: if false; }` — purely restrictive (clients get no access; backend Admin SDK bypasses rules). **Not deployed** |
+| Email notifications | **Not configured** — no email provider/dependency exists in the repo; Firestore is the reliable mechanism. Forwarding to `bistrobuddies@gmail.com` is a separate future setup step |
+| Tests | `src/contact-messages.test.ts` — success + trimming, ignored client `userId`/`status`/timestamps, missing fields, invalid email, whitespace-only, over-length, 401 missing/invalid token, Firestore failure → `500` (no false success), `503` without credentials, no GET/PATCH/DELETE access, rate limit; plus unit tests in `src/lib/validation.test.ts` |
+| Docs | `docs/API_CONTRACT.md` §4 "Contact messages", `README.md` |
+
+No new env vars. Status: `npm run typecheck`, `npm run lint`, `npm run build`
+and `npm test` pass (7 files, **149 tests**).

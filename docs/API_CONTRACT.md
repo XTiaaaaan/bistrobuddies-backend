@@ -22,7 +22,8 @@ prefix (the router is mounted at both `/api` and `/` for serverless hosts);
 | Prices | Clients **never** send prices. Totals are computed server-side from Firestore product records |
 
 Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
-`GET /api/products*` 120/min; `/api/admin/*` 60/min; `POST /api/admin/uploads`
+`POST /api/contact-messages` 10/min; `GET /api/products*` 120/min;
+`/api/admin/*` 60/min; `POST /api/admin/uploads`
 and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 `Retry-After` header.
 
@@ -37,12 +38,15 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | GET | `/api/products/:id` | — (public) | Single product or `404 product_not_found` |
 | POST | `/api/orders` | Bearer (any signed-in user) | Creates an order; prices computed server-side |
 | GET | `/api/orders/:id` | Bearer (owner or admin) | Others get `404 order_not_found` (no id probing) |
+| POST | `/api/contact-messages` | Bearer (any signed-in user) | Stores a "Contact Us" submission → `201 { id, status }` (§4) |
 | POST | `/api/admin/products` | Bearer (admin) | Create product → `201 { id }` |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Delete → `{ id }` |
 | POST | `/api/admin/uploads` | Bearer (admin) | Store a product image on the local disk → `201 { imageUrl, … }` (§6, development only) |
 | POST | `/api/profile/photo` | Bearer (any signed-in user) | Store the caller's profile picture → `201 { imageUrl, … }` (§6, development only) |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Status transition → `{ id, orderStatus }` |
+| GET | `/api/admin/contact-messages` | Bearer (admin) | Customer "Contact Us" messages, newest first; `?status`, `?page`, `?pageSize` (§4) |
+| PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | `{ status: "READ" \| "RESOLVED" }` → `{ id, status }` (§4) |
 
 CORS allows `GET, POST, PATCH, DELETE, OPTIONS` from `ALLOWED_ORIGINS`.
 
@@ -191,6 +195,117 @@ recomputed or rewritten.
 from every non-terminal state. Re-sending the current status is an
 idempotent no-op; anything else → `400 invalid_status_transition`.
 
+### Contact messages — POST /api/contact-messages
+
+The mobile app's **Contact Us** form. Like the app's other customer-facing
+write endpoints (`POST /api/orders`, `POST /api/profile/photo`) it requires
+`Authorization: Bearer <any valid Firebase ID token>`; the sender's `userId`
+is taken from the verified token and **never** from the body. 10
+requests/min/IP.
+
+**Request:**
+
+```jsonc
+{
+  "name": "Juan dela Cruz",     // required, trimmed, 1–120 chars
+  "email": "juan@example.com",  // required, trimmed, valid email, ≤254 chars
+  "subject": "Order question",  // required, trimmed, 1–150 chars
+  "message": "…"                // required, trimmed, 1–2000 chars
+}
+```
+
+- Values are trimmed server-side; empty or whitespace-only values are
+  rejected (`400 invalid_request` with per-field `details`).
+- Any other properties (`userId`, `status`, `createdAt`, `id`, …) are
+  **ignored** — the document id, `userId`, `status` and timestamps are
+  always server-generated.
+
+**Response `201`:**
+
+```json
+{ "id": "<server-generated id>", "status": "NEW" }
+```
+
+The `201` is returned only after Firestore confirms the write; a storage
+failure returns `500 internal_error` (never a false success). Missing server
+credentials → `503 server_not_configured`.
+
+**Storage:** Firestore collection `contactMessages`, document fields `id`,
+`name`, `email`, `subject`, `message`, `userId` (verified token),
+`status` (`NEW` initially), `createdAt`/`updatedAt` (server timestamps).
+Clients have **no** access to this collection (`firestore.rules` denies all
+client reads/writes); there is deliberately **no** GET/PATCH/DELETE endpoint
+on `/api/contact-messages`, so customers can never read, edit or delete
+contact messages through the API. Administrators read messages and change
+their workflow status through the separate, admin-guarded endpoints below.
+
+### Admin — GET /api/admin/contact-messages
+
+Lists stored messages for the admin site, newest first. Guard: Bearer admin
+token — `401 unauthorized` without/with a bad token, `403 forbidden` for
+non-admin users (role read server-side from `users/{uid}`). Rate limit
+60/min/IP.
+
+Query parameters (all optional; invalid values → `400 invalid_request` with
+per-field `details`):
+
+| Param | Rule |
+| --- | --- |
+| `status` | `NEW`, `READ` or `RESOLVED` — filters the list |
+| `page` | positive integer, default `1` |
+| `pageSize` | integer 1–100, default `25` (hard maximum) |
+
+**Response `200`:**
+
+```json
+{
+  "messages": [
+    {
+      "id": "…",
+      "name": "Juan dela Cruz",
+      "email": "juan@example.com",
+      "subject": "Order question",
+      "message": "…",
+      "status": "NEW",
+      "createdAt": "2026-10-09T12:00:00.000Z",
+      "updatedAt": "2026-10-09T12:00:00.000Z"
+    }
+  ],
+  "page": 1,
+  "pageSize": 25,
+  "total": 1,
+  "totalPages": 1
+}
+```
+
+Only the fields above are returned — the stored `userId` and any other
+document properties never leave the server. Messages on a page beyond
+`totalPages` return an empty `messages` array (not an error).
+
+### Admin — PATCH /api/admin/contact-messages/:id/status
+
+Changes a message's workflow status. Same admin guard and rate limit as the
+list endpoint.
+
+**Request:** `{ "status": "READ" }` — only `READ` and `RESOLVED` are
+accepted; `NEW` (the server-assigned initial status) and any other value →
+`400 invalid_request`. Unknown id → `404 contact_message_not_found`. Only
+`status` and `updatedAt` are written — the customer's submission
+(`name`/`email`/`subject`/`message`/`userId`) and `createdAt` can never be
+changed through this endpoint.
+
+**Response `200`:**
+
+```json
+{ "id": "<message id>", "status": "READ" }
+```
+
+**Email notifications:** not configured in this repository — Firestore
+storage is the reliable submission mechanism. Forwarding new messages to
+`bistrobuddies@gmail.com` requires wiring a real email provider (env-based
+credentials, separate failure handling that does not undo a successful
+store) as a future setup step; no email is sent or claimed today.
+
 ---
 
 ## 5. Firestore access for clients
@@ -201,10 +316,12 @@ idempotent no-op; anything else → `400 invalid_status_transition`.
 | `users/{uid}` | self or admin | self (role preserved), or use the API |
 | `orders` | own orders or admin | **denied** — create only via `POST /api/orders`; status changes admin-only via the API |
 | `payments` | own or admin | **denied** — backend-managed (PayMongo not yet implemented) |
+| `contactMessages` | **denied** (everyone, admins included) | **denied** — create only via `POST /api/contact-messages` (Admin SDK) |
 
-Only `products` is publicly readable; `users`, `orders` and `payments` stay
-private. The Admin SDK (backend) bypasses these rules, which is how the API
-creates orders and products. **Deploy `firestore.rules` with the Firebase CLI
+Only `products` is publicly readable; `users`, `orders`, `payments` and
+`contactMessages` stay private. The Admin SDK (backend) bypasses these rules,
+which is how the API creates orders, products and contact messages. **Deploy
+`firestore.rules` with the Firebase CLI
 against `bistrobuddies-4f179` — this repository does not deploy anything.**
 
 ---
@@ -339,3 +456,8 @@ Firestore.**
   updates).
 - Admin order list endpoint (`GET /api/admin/orders` does not exist; use
   Firestore reads, which are admin-allowed, until it does).
+- Email notifications for contact messages (no email provider is configured;
+  submissions are stored in Firestore only — see §4 "Contact messages").
+  Admin listing/status updates are implemented (§4 "Admin — GET
+  /api/admin/contact-messages"), but no email is sent when a message
+  arrives.

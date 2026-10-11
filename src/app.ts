@@ -8,9 +8,11 @@ import {
   notFoundHandler,
 } from './middleware/error-handler';
 import { logger } from './logger';
+import { adminContactMessagesRouter } from './routes/admin-contact-messages';
 import { adminOrdersRouter } from './routes/admin-orders';
 import { adminProductsRouter } from './routes/admin-products';
 import { adminUploadsRouter } from './routes/admin-uploads';
+import { contactMessagesRouter } from './routes/contact-messages';
 import { healthRouter } from './routes/health';
 import { ordersRouter } from './routes/orders';
 import { productsRouter } from './routes/products';
@@ -55,8 +57,10 @@ export function createApp(): Express {
   api.use(healthRouter);
   api.use(productsRouter);
   api.use(ordersRouter);
+  api.use(contactMessagesRouter);
   api.use('/admin/products', adminProductsRouter);
   api.use('/admin/uploads', adminUploadsRouter);
+  api.use('/admin/contact-messages', adminContactMessagesRouter);
   api.use('/admin', adminOrdersRouter);
   api.use('/profile', profileUploadsRouter);
 

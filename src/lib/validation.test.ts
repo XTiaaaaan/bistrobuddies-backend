@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError, FieldIssue } from '../errors';
 import {
+  CONTACT_MESSAGES_DEFAULT_PAGE_SIZE,
+  CONTACT_MESSAGES_MAX_PAGE_SIZE,
   allowedNextStatuses,
+  readContactMessageId,
+  readContactMessageListQuery,
+  validateContactMessageRequest,
+  validateContactMessageStatusUpdate,
   validateCreateOrderRequest,
   validateOrderStatus,
   validateProductInput,
@@ -304,5 +310,210 @@ describe('order status transitions', () => {
     expect(allowedNextStatuses('COMPLETED')).toEqual([]);
     expect(allowedNextStatuses('CANCELLED')).toEqual([]);
     expect(allowedNextStatuses('CONFIRMED')).not.toContain('PENDING');
+  });
+});
+
+describe('validateContactMessageRequest', () => {
+  function validContactBody() {
+    return {
+      name: 'Juan dela Cruz',
+      email: 'juan@example.com',
+      subject: 'Order question',
+      message: 'Hello, where is my order?',
+    };
+  }
+
+  it('accepts a valid payload and trims whitespace', () => {
+    const result = validateContactMessageRequest({
+      name: '  Juan dela Cruz  ',
+      email: ' juan@example.com ',
+      subject: ' Order question ',
+      message: ' Hello! ',
+    });
+    expect(result).toEqual({
+      name: 'Juan dela Cruz',
+      email: 'juan@example.com',
+      subject: 'Order question',
+      message: 'Hello!',
+    });
+  });
+
+  it('rejects missing required fields with per-field details', () => {
+    expectFieldIssues(() => validateContactMessageRequest({}), /name/);
+    expectFieldIssues(() => validateContactMessageRequest({}), /email/);
+    expectFieldIssues(() => validateContactMessageRequest({}), /subject/);
+    expectFieldIssues(() => validateContactMessageRequest({}), /message/);
+  });
+
+  it('rejects non-string field values', () => {
+    expectFieldIssues(
+      () => validateContactMessageRequest({ ...validContactBody(), name: 42 }),
+      /name/
+    );
+  });
+
+  it('rejects an invalid email', () => {
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({ ...validContactBody(), email: 'nope' }),
+      /email/
+    );
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({
+          ...validContactBody(),
+          email: 'a@b',
+        }),
+      /email/
+    );
+  });
+
+  it('rejects whitespace-only values', () => {
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({
+          ...validContactBody(),
+          message: '   \n\t  ',
+        }),
+      /message/
+    );
+  });
+
+  it('rejects excessively long values', () => {
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({
+          ...validContactBody(),
+          name: 'n'.repeat(121),
+        }),
+      /name/
+    );
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({
+          ...validContactBody(),
+          subject: 's'.repeat(151),
+        }),
+      /subject/
+    );
+    expectFieldIssues(
+      () =>
+        validateContactMessageRequest({
+          ...validContactBody(),
+          message: 'm'.repeat(2001),
+        }),
+      /message/
+    );
+  });
+
+  it('rejects non-object bodies', () => {
+    expect(() => validateContactMessageRequest('nope')).toThrow(ApiError);
+    expect(() => validateContactMessageRequest(null)).toThrow(ApiError);
+    expect(() => validateContactMessageRequest([])).toThrow(ApiError);
+  });
+
+  it('only reads the four contact fields (client extras are ignored)', () => {
+    const result = validateContactMessageRequest({
+      ...validContactBody(),
+      userId: 'admin-1',
+      status: 'RESOLVED',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    });
+    expect(result).toEqual(validContactBody());
+    expect(result).not.toHaveProperty('userId');
+    expect(result).not.toHaveProperty('status');
+    expect(result).not.toHaveProperty('createdAt');
+  });
+});
+
+describe('validateContactMessageStatusUpdate', () => {
+  it('accepts READ and RESOLVED', () => {
+    expect(validateContactMessageStatusUpdate({ status: 'READ' })).toBe('READ');
+    expect(validateContactMessageStatusUpdate({ status: 'RESOLVED' })).toBe(
+      'RESOLVED'
+    );
+  });
+
+  it('rejects NEW, unknown values and non-strings', () => {
+    expect(() => validateContactMessageStatusUpdate({ status: 'NEW' })).toThrow(
+      ApiError
+    );
+    expect(() =>
+      validateContactMessageStatusUpdate({ status: 'BOGUS' })
+    ).toThrow(ApiError);
+    expect(() => validateContactMessageStatusUpdate({})).toThrow(ApiError);
+    expect(() => validateContactMessageStatusUpdate(null)).toThrow(ApiError);
+    expect(() =>
+      validateContactMessageStatusUpdate({ status: 42 })
+    ).toThrow(ApiError);
+  });
+});
+
+describe('readContactMessageListQuery', () => {
+  it('defaults to page 1 with the default page size and no filter', () => {
+    expect(readContactMessageListQuery({})).toEqual({
+      page: 1,
+      pageSize: CONTACT_MESSAGES_DEFAULT_PAGE_SIZE,
+    });
+  });
+
+  it('accepts a valid status filter and pagination', () => {
+    expect(
+      readContactMessageListQuery({ status: 'READ', page: '2', pageSize: '10' })
+    ).toEqual({ page: 2, pageSize: 10, status: 'READ' });
+  });
+
+  it('rejects an unknown status filter', () => {
+    expectFieldIssues(
+      () => readContactMessageListQuery({ status: 'BOGUS' }),
+      /status/
+    );
+    expectFieldIssues(
+      () => readContactMessageListQuery({ status: ['NEW'] }),
+      /status/
+    );
+  });
+
+  it('rejects invalid pagination values', () => {
+    expectFieldIssues(
+      () => readContactMessageListQuery({ page: '0' }),
+      /page/
+    );
+    expectFieldIssues(
+      () => readContactMessageListQuery({ page: 'many' }),
+      /page/
+    );
+    expectFieldIssues(
+      () => readContactMessageListQuery({ pageSize: '0' }),
+      /pageSize/
+    );
+    expectFieldIssues(
+      () =>
+        readContactMessageListQuery({
+          pageSize: String(CONTACT_MESSAGES_MAX_PAGE_SIZE + 1),
+        }),
+      /pageSize/
+    );
+  });
+
+  it('accepts the maximum page size', () => {
+    expect(
+      readContactMessageListQuery({
+        pageSize: String(CONTACT_MESSAGES_MAX_PAGE_SIZE),
+      }).pageSize
+    ).toBe(CONTACT_MESSAGES_MAX_PAGE_SIZE);
+  });
+});
+
+describe('readContactMessageId', () => {
+  it('accepts and decodes a normal id', () => {
+    expect(readContactMessageId('msg-1')).toBe('msg-1');
+    expect(readContactMessageId('%20msg-1%20')).toBe('msg-1');
+  });
+
+  it('rejects empty and oversized ids', () => {
+    expect(() => readContactMessageId('')).toThrow(ApiError);
+    expect(() => readContactMessageId('   ')).toThrow(ApiError);
+    expect(() => readContactMessageId('m'.repeat(129))).toThrow(ApiError);
   });
 });

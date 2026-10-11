@@ -67,5 +67,16 @@ service cloud.firestore {
       allow create: if false;
       allow update, delete: if isAdmin();
     }
+
+    // contactMessages: customer "Contact Us" submissions. Only the trusted
+    // backend writes them (POST /api/contact-messages via the Admin SDK,
+    // which bypasses these rules). Clients may neither read nor write —
+    // customers cannot view their own or other customers' messages, and
+    // nobody can tamper with stored messages. This block is purely
+    // restrictive documentation of that intent (an unmatched collection is
+    // already denied by default).
+    match /contactMessages/{messageId} {
+      allow read, write: if false;
+    }
   }
 }
