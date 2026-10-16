@@ -4,13 +4,19 @@ import * as path from 'node:path';
 import { config } from '../config';
 
 /**
- * Local development image storage helpers.
+ * Image validation + legacy local-disk helpers.
  *
- * Files are written to a single flat directory (`UPLOAD_DIR`, default
- * `<repo>/uploads`) and served back at `GET /uploads/<file>`. This is
- * **development storage only** — the local disk is not durable, not backed
- * up and not shared between instances, so production must use Firebase
- * Storage instead (not implemented in this repository).
+ * New uploads go to Cloudinary (see `lib/cloudinary.ts` + `lib/image-upload.ts`)
+ * — the local disk is not durable, not backed up and not shared between
+ * instances (e.g. Render), so it is never used for new uploads.
+ *
+ * The helpers below are retained for backwards compatibility:
+ * - `detectImageType` / `SUPPORTED_IMAGE_*` / `formatMaxUploadSize` are still
+ *   the single source of truth for validation (magic bytes, never MIME/name).
+ * - `ensureUploadsDir` / `resolveUploadPath` / `saveImage` / `uploadsDir` are
+ *   legacy local-disk writers, kept only so historical `GET /uploads/<file>`
+ *   files remain servable. New code must not call `saveImage` — use
+ *   `saveUploadedImage` (Cloudinary) instead.
  *
  * Safety rules enforced here:
  * - the client-supplied file name is never used (a fresh UUID name is

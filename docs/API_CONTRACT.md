@@ -42,8 +42,8 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | POST | `/api/admin/products` | Bearer (admin) | Create product → `201 { id }` |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Delete → `{ id }` |
-| POST | `/api/admin/uploads` | Bearer (admin) | Store a product image on the local disk → `201 { imageUrl, … }` (§6, development only) |
-| POST | `/api/profile/photo` | Bearer (any signed-in user) | Store the caller's profile picture → `201 { imageUrl, … }` (§6, development only) |
+| POST | `/api/admin/uploads` | Bearer (admin) | Store a product image in Cloudinary → `201 { imageUrl, publicId, … }` (§6) |
+| POST | `/api/profile/photo` | Bearer (any signed-in user) | Store the caller's profile picture in Cloudinary → `201 { imageUrl, publicId, … }` (§6) |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Status transition → `{ id, orderStatus }` |
 | GET | `/api/admin/contact-messages` | Bearer (admin) | Customer "Contact Us" messages, newest first; `?status`, `?page`, `?pageSize` (§4) |
 | PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | `{ status: "READ" \| "RESOLVED" }` → `{ id, status }` (§4) |
@@ -326,27 +326,38 @@ against `bistrobuddies-4f179` — this repository does not deploy anything.**
 
 ---
 
-## 6. Image uploads (local development only)
+## 6. Image uploads (Cloudinary)
 
-> ⚠️ **Development only — not production storage.** Files are written to this
-> machine's disk in `UPLOAD_DIR` (default `uploads/`, git-ignored) and served
-> by the local backend. Local disk is not persistent, not backed up and not
-> shared between instances (a restart or redeploy can lose it); **do not rely
-> on it outside local development.** The production path is Firebase Storage,
-> which is **not implemented** in this repository.
+> Cloudinary is the permanent image store. Validated images are uploaded
+> server-side with the official Cloudinary Node.js SDK and the HTTPS
+> `secure_url` is returned as `imageUrl`. Cloudinary credentials
+> (`CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`)
+> live **only on the backend** (env vars / hosting provider secrets) and are
+> never returned to clients. The local `uploads/` directory is **not** used
+> for new uploads — local disk is not durable on hosts like Render — and
+> there is deliberately **no local fallback**: when Cloudinary is not
+> configured the endpoints fail with `503 server_not_configured` instead of
+> pretending the upload succeeded. (There is no reliable
+> development-vs-production signal in the current configuration, so a
+> dev-only fallback would risk silently storing production images
+> ephemerally.)
+>
+> Existing products and historical orders are untouched: no migration rewrites
+> stored `imageUrl` values and no old Cloudinary asset is auto-deleted.
 
 ### POST /api/admin/uploads
 
 | Topic | Rule |
 | --- | --- |
-| Auth | `Authorization: Bearer <admin ID token>` — `401 unauthorized` without/with a bad token, `403 forbidden` for non-admin users |
+| Auth | `Authorization: Bearer <admin ID token>` — `401 unauthorized` without/with a bad token, `403 forbidden` for non-admin users (verified Firebase token + server-side `users/{uid}.role == 'admin'` check) |
 | Content type | `multipart/form-data` with exactly **one** file field named `file` |
 | Accepted images | **JPEG, PNG, WebP** — verified from the file's magic bytes, never from the client's file name or `Content-Type` → otherwise `415 unsupported_media_type` |
 | Size limit | `UPLOAD_MAX_BYTES`, default **5 MB** (5 242 880 bytes) → `413 file_too_large` |
 | Other fields | none accepted → `400 invalid_request` |
 | Missing/empty file | `400 invalid_request` |
 | Rate limit | 30 requests/min/IP → `429 rate_limited` |
-| Missing server credentials | `503 server_not_configured` |
+| Missing Cloudinary config | `503 server_not_configured` (clear message, no false success) |
+| Cloudinary failure | `500 upload_failed` |
 
 **Request** (admin site, `environment.apiBaseUrl` = `http://localhost:3001/api`):
 
@@ -359,7 +370,7 @@ const response = await fetch(`${environment.apiBaseUrl}/admin/uploads`, {
   headers: { Authorization: `Bearer ${await admin.getIdToken()}` },
   body: form, // browser sets multipart/form-data + boundary
 });
-const { imageUrl } = await response.json(); // 201
+const { imageUrl, publicId } = await response.json(); // 201
 ```
 
 ```bash
@@ -372,25 +383,34 @@ curl -X POST http://localhost:3001/api/admin/uploads \
 
 ```json
 {
-  "imageUrl": "http://localhost:3001/uploads/1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
-  "path": "/uploads/1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
-  "fileName": "1760000000000-8f14e45f-ea3b-4d2f-9c1a-2b3c4d5e6f70.png",
+  "imageUrl": "https://res.cloudinary.com/<cloud-name>/image/upload/v1760000000/bistrobuddies/abc123.png",
+  "publicId": "bistrobuddies/abc123",
+  "fileName": "bistrobuddies/abc123",
   "mimeType": "image/png",
   "size": 48213,
   "uploadedAt": "2026-10-09T12:00:00.000Z"
 }
 ```
 
+- `imageUrl` is the HTTPS Cloudinary `secure_url` — put it straight into
+  `<img src>` and store it as `products/{id}.imageUrl`.
+- `publicId` is the Cloudinary `public_id` (also echoed as `fileName` for
+  backwards compatibility with the old local-disk response). There is no
+  `path` field anymore: the old backend-relative `/uploads/<file>` path only
+  applied to local-disk storage.
+- The legacy local response (`imageUrl: http://…/uploads/<file>`,
+  `path: /uploads/<file>`) no longer applies to new uploads.
+
 **Error codes:** `400 invalid_request`, `401 unauthorized`, `403 forbidden`,
 `413 file_too_large`, `415 unsupported_media_type`, `429 rate_limited`,
-`503 server_not_configured`.
+`500 upload_failed`, `503 server_not_configured`.
 
 ### POST /api/profile/photo
 
 Customer profile picture upload — identical rules to
 `POST /api/admin/uploads` (multipart field `file`, JPEG/PNG/WebP by magic
-bytes, `UPLOAD_MAX_BYTES` default 5 MB, no other form fields, same error
-codes) with two differences:
+bytes, `UPLOAD_MAX_BYTES` default 5 MB, no other form fields, Cloudinary
+storage, same error codes) with two differences:
 
 | Topic | Rule |
 | --- | --- |
@@ -410,7 +430,7 @@ const { imageUrl } = await response.json(); // 201
 ```
 
 The response body has the same shape as the admin upload (`201` with
-`imageUrl`, `path`, `fileName`, `mimeType`, `size`, `uploadedAt`). The
+`imageUrl`, `publicId`, `fileName`, `mimeType`, `size`, `uploadedAt`). The
 endpoint writes nothing to Firestore: the mobile app stores the returned
 **URL string** as `users/{uid}.photoUrl` (and mirrors it into the Firebase
 Auth `photoURL`); the image bytes and any base64 representation are never
@@ -418,19 +438,19 @@ written to Firestore.
 
 ### Image URL behaviour
 
-- `imageUrl` is **absolute**, built from `API_BASE_URL` (default
-  `http://localhost:<PORT>`) so frontends on other origins
-  (`http://localhost:4200`, `http://localhost:8100`, Capacitor) can put it
-  straight into `<img src>`; `path` is the backend-relative form of the same
-  file.
-- Files are served read-only by **`GET /uploads/<fileName>`** — no directory
-  listing, no writes, `Cache-Control: max-age=3600`, and
-  `Cross-Origin-Resource-Policy: cross-origin` so cross-origin `<img>` tags
-  are not blocked. Unknown names return `404 not_found`; `..`/encoded path
-  traversal is rejected by the static handler.
-- File names are generated **server-side** as `<epochMs>-<uuid>.<ext>`; the
-  client's file name is discarded, so no path from the client ever reaches
-  the filesystem. The extension comes from the detected image type.
+- `imageUrl` is the absolute HTTPS Cloudinary `secure_url`, so frontends on
+  any origin (`http://localhost:4200`, `http://localhost:8100`, Capacitor,
+  production domains) can put it straight into `<img src>` with no extra
+  host configuration.
+- Historical local files are still served read-only by
+  **`GET /uploads/<fileName>`** — no directory listing, no writes,
+  `Cache-Control: max-age=3600`, and `Cross-Origin-Resource-Policy:
+  cross-origin` so cross-origin `<img>` tags are not blocked. Unknown names
+  return `404 not_found`; `..`/encoded path traversal is rejected by the
+  static handler. **New uploads never create files here.**
+- The client's file name is discarded for storage (Cloudinary assigns the
+  `public_id` under the `bistrobuddies/` folder), so no path from the client
+  ever reaches the filesystem or the storage identifier.
 - Reads need no authentication (matching the public product catalog); writes
   require a Bearer token — admin for product images, any signed-in user for
   profile photos.
@@ -439,18 +459,21 @@ written to Firestore.
 
 The upload endpoint writes **nothing** to Firestore. Take the returned
 `imageUrl` and send it with the product write — `POST /api/admin/products`
-or `PATCH /api/admin/products/:id` with `{ "imageUrl": "http://localhost:3001/uploads/…" }`.
-Only that URL string plus the product metadata are stored on `products/{id}`;
-**the image bytes and any base64 representation are never written to
-Firestore.**
+or `PATCH /api/admin/products/:id` with
+`{ "imageUrl": "https://res.cloudinary.com/…", "cloudinaryPublicId": "bistrobuddies/…" }`.
+Only those URL/identifier strings plus the product metadata are stored on
+`products/{id}`; **the image bytes and any base64 representation are never
+written to Firestore.** Existing `imageUrl` values (Cloudinary HTTPS URLs,
+old local `/uploads/…` URLs, or bundled `assets/…` paths) keep working as-is
+and are never rewritten by reads or by new uploads.
 
 ---
 
 ## 7. Not implemented (out of scope)
 
-- **Firebase Storage / cloud image hosting** — the upload endpoints above are
-  local-disk only and must be replaced by Firebase Storage before production
-  use.
+- **Firebase Storage** — not used. Permanent image hosting is Cloudinary
+  (§6); the remaining local-disk surface is read-only legacy serving of
+  historical `GET /uploads/<file>` files only.
 - PayMongo payments (no payment endpoint/webhook; `paymentMethod: "ONLINE"`
   is stored but inert; `paymentStatus` only changes through admin status
   updates).

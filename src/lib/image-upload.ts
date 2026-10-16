@@ -2,11 +2,10 @@ import { NextFunction, Request, Response } from 'express';
 import multer from 'multer';
 import { config } from '../config';
 import { ApiError, badRequest, FieldIssue } from '../errors';
+import { uploadToCloudinary } from './cloudinary';
 import {
   detectImageType,
   formatMaxUploadSize,
-  saveImage,
-  SavedImage,
   SUPPORTED_IMAGE_LABELS,
 } from './uploads';
 
@@ -17,9 +16,21 @@ import {
  * All of these endpoints share the same contract: `multipart/form-data` with
  * exactly one file field named `file`, JPEG/PNG/WebP only (detected from
  * magic bytes, never from the client's file name or `Content-Type`), at most
- * `UPLOAD_MAX_BYTES`, and no other form fields. See
- * `docs/API_CONTRACT.md` §6.
+ * `UPLOAD_MAX_BYTES`, and no other form fields. Validated images are stored
+ * in Cloudinary (server-side only) and the HTTPS `secure_url` is returned.
+ * See `docs/API_CONTRACT.md` §6.
  */
+
+export interface UploadedImage {
+  /** Cloudinary `public_id` (also returned as `fileName` for backwards compat). */
+  publicId: string;
+  /** Backwards-compatible alias of `publicId` (previously the local file name). */
+  fileName: string;
+  /** HTTPS Cloudinary URL — returned as `imageUrl`. */
+  publicUrl: string;
+  mimeType: string;
+  size: number;
+}
 
 /** Field name the client must use in the multipart form. */
 export const UPLOAD_FIELD_NAME = 'file';
@@ -88,15 +99,23 @@ export function parseMultipartImage(
 }
 
 /**
- * Validates a parsed upload and writes it to the local uploads directory.
+ * Validates a parsed upload (magic bytes + size) and stores it in Cloudinary.
  *
  * Throws the API errors the endpoint should answer with:
- * `400 invalid_request` for a missing or empty file and
+ * `400 invalid_request` for a missing or empty file,
  * `415 unsupported_media_type` for anything that is not a JPEG/PNG/WebP by
- * content. Oversized files never reach this point — multer rejects them
- * while parsing (413, see {@link mapUploadError}).
+ * content, `503 server_not_configured` when Cloudinary credentials are
+ * missing, and `500 upload_failed` when Cloudinary rejects the upload.
+ * Oversized files never reach this point — multer rejects them while
+ * parsing (413, see {@link mapUploadError}).
+ *
+ * Never writes to the local filesystem: Render-style hosts do not provide
+ * durable local disk, so there is deliberately no local fallback (see
+ * `lib/cloudinary.ts`).
  */
-export function saveUploadedImage(file: Express.Multer.File | undefined): SavedImage {
+export async function saveUploadedImage(
+  file: Express.Multer.File | undefined
+): Promise<UploadedImage> {
   if (!file) {
     throw badRequest(
       `Attach the image as multipart/form-data in a field named "${UPLOAD_FIELD_NAME}".`,
@@ -125,5 +144,12 @@ export function saveUploadedImage(file: Express.Multer.File | undefined): SavedI
     );
   }
 
-  return saveImage(file.buffer, type);
+  const stored = await uploadToCloudinary(file.buffer, type);
+  return {
+    publicId: stored.publicId,
+    fileName: stored.publicId,
+    publicUrl: stored.secureUrl,
+    mimeType: stored.mimeType,
+    size: stored.size,
+  };
 }

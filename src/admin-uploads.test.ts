@@ -12,6 +12,7 @@ import {
   expect,
   it,
   vi,
+  type Mock,
 } from 'vitest';
 
 const state = vi.hoisted(() => ({
@@ -52,11 +53,21 @@ vi.mock('./firebase/admin', () => {
   };
 });
 
+vi.mock('cloudinary', () => ({
+  v2: {
+    config: vi.fn(),
+    uploader: { upload: vi.fn() },
+  },
+}));
+
 // Overrides must be in place before the app (and its config) is imported.
 const UPLOAD_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bb-uploads-'));
 process.env['UPLOAD_DIR'] = UPLOAD_DIR;
 process.env['UPLOAD_MAX_BYTES'] = '1024';
 process.env['API_BASE_URL'] = 'http://localhost:3001';
+process.env['CLOUDINARY_CLOUD_NAME'] = 'test-cloud';
+process.env['CLOUDINARY_API_KEY'] = 'test-key';
+process.env['CLOUDINARY_API_SECRET'] = 'test-secret';
 
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -106,17 +117,28 @@ function multipart(options: UploadOptions): {
   };
 }
 
-describe('POST /api/admin/uploads (local image uploads)', () => {
+describe('POST /api/admin/uploads (Cloudinary image uploads)', () => {
   let server: Server;
   let base: string;
   let createApp: typeof import('./app').createApp;
+  let uploadMock: Mock;
 
   beforeAll(async () => {
     ({ createApp } = await import('./app'));
+    const { v2: cloudinary } = await import('cloudinary');
+    uploadMock = cloudinary.uploader.upload as unknown as Mock;
   });
 
   beforeEach(async () => {
     state.userRole = 'admin';
+    uploadMock.mockReset();
+    uploadMock.mockImplementation(async (dataUri: string) => {
+      const mime = dataUri.slice(5, dataUri.indexOf(';'));
+      return {
+        secure_url: `https://res.cloudinary.com/test-cloud/image/upload/v1/bistrobuddies/test-${mime.replace('/', '-')}`,
+        public_id: `bistrobuddies/test-${mime.replace('/', '-')}`,
+      };
+    });
     const app = createApp();
     await new Promise<void>((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve);
@@ -151,12 +173,11 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
   }
 
   it('rejects requests without a Bearer token (401)', async () => {
-    const before = filesInUploadDir().length;
     const response = await upload({ bytes: imageBytes('image/png') });
     expect(response.status).toBe(401);
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe('unauthorized');
-    expect(filesInUploadDir()).toHaveLength(before);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects invalid tokens (401)', async () => {
@@ -165,10 +186,10 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
       bytes: imageBytes('image/png'),
     });
     expect(response.status).toBe(401);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects signed-in non-admin users (403)', async () => {
-    const before = filesInUploadDir().length;
     state.userRole = 'customer';
     const response = await upload({
       token: 'valid-customer',
@@ -177,11 +198,10 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     expect(response.status).toBe(403);
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe('forbidden');
-    expect(filesInUploadDir()).toHaveLength(before);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects non-image content (415)', async () => {
-    const before = filesInUploadDir().length;
     const response = await upload({
       token: 'valid-admin',
       fileName: 'notes.txt',
@@ -191,7 +211,7 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     expect(response.status).toBe(415);
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe('unsupported_media_type');
-    expect(filesInUploadDir()).toHaveLength(before);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects a disguised image whose bytes are not an image (415)', async () => {
@@ -202,10 +222,10 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
       bytes: Buffer.from('PNG? nope, just text pretending to be one.'),
     });
     expect(response.status).toBe(415);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects files above the configured size limit (413)', async () => {
-    const before = filesInUploadDir().length;
     // UPLOAD_MAX_BYTES is 1024 in this suite; 2000 bytes must fail.
     const response = await upload({
       token: 'valid-admin',
@@ -214,7 +234,7 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     expect(response.status).toBe(413);
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe('file_too_large');
-    expect(filesInUploadDir()).toHaveLength(before);
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
   it('rejects a request without a file field (400)', async () => {
@@ -226,10 +246,10 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe('invalid_request');
+    expect(uploadMock).not.toHaveBeenCalled();
   });
 
-  it('accepts JPEG, PNG and WebP images (201)', async () => {
-    const before = filesInUploadDir().length;
+  it('accepts JPEG, PNG and WebP images (201) and returns an HTTPS secure_url', async () => {
     for (const mimeType of ['image/jpeg', 'image/png', 'image/webp']) {
       const bytes = imageBytes(mimeType);
       const response = await upload({ token: 'valid-admin', bytes });
@@ -238,31 +258,26 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
       const body = (await response.json()) as Record<string, unknown>;
       expect(body['mimeType']).toBe(mimeType);
       expect(body['size']).toBe(bytes.length);
-      expect(body['path']).toBe(`/uploads/${body['fileName']}`);
-
-      const fileName = body['fileName'] as string;
-      const saved = path.join(UPLOAD_DIR, fileName);
-      expect(fs.existsSync(saved)).toBe(true);
-      expect(fs.readFileSync(saved).equals(bytes)).toBe(true);
+      expect(typeof body['imageUrl']).toBe('string');
+      expect(body['imageUrl'] as string).toMatch(/^https:\/\//);
+      expect(typeof body['publicId']).toBe('string');
+      expect(body['fileName']).toBe(body['publicId']);
+      expect(typeof body['uploadedAt']).toBe('string');
+      expect(uploadMock).toHaveBeenCalled();
     }
-    expect(filesInUploadDir()).toHaveLength(before + 3);
   });
 
-  it('returns an absolute imageUrl built from API_BASE_URL', async () => {
+  it('does not write new uploads to the local filesystem', async () => {
+    const before = filesInUploadDir().length;
     const response = await upload({
       token: 'valid-admin',
       bytes: imageBytes('image/png'),
     });
     expect(response.status).toBe(201);
-    const body = (await response.json()) as Record<string, unknown>;
-    expect(body['imageUrl']).toBe(
-      `http://localhost:3001/uploads/${body['fileName']}`
-    );
-    expect(typeof body['uploadedAt']).toBe('string');
+    expect(filesInUploadDir()).toHaveLength(before);
   });
 
-  it('generates a safe unique name and ignores the client file name', async () => {
-    const before = filesInUploadDir();
+  it('ignores the client file name when storing in Cloudinary', async () => {
     const response = await upload({
       token: 'valid-admin',
       fileName: '../../evil.png',
@@ -273,17 +288,10 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     const fileName = body['fileName'] as string;
 
     expect(fileName).not.toContain('..');
-    expect(fileName).not.toContain('/');
-    expect(fileName).not.toContain('\\');
-    expect(path.extname(fileName)).toBe('.png');
-    expect(path.basename(fileName)).toBe(fileName);
-    // Nothing escaped the uploads directory.
-    expect(path.resolve(UPLOAD_DIR, fileName).startsWith(UPLOAD_DIR)).toBe(true);
-    const written = filesInUploadDir().filter((name) => !before.includes(name));
-    expect(written).toEqual([fileName]);
-    expect(fs.existsSync(path.join(path.dirname(UPLOAD_DIR), 'evil.png'))).toBe(
-      false
-    );
+    // Cloudinary public_ids use a folder prefix (e.g. `bistrobuddies/…`);
+    // the traversal attempt must not survive — only the generated public_id
+    // is returned.
+    expect(fileName).not.toContain('evil');
   });
 
   it('never stores the image bytes in the API response', async () => {
@@ -296,22 +304,59 @@ describe('POST /api/admin/uploads (local image uploads)', () => {
     expect(text.length).toBeLessThan(1000);
   });
 
-  it('serves the stored image at GET /uploads/<file> with a cross-origin CORP header', async () => {
-    const bytes = imageBytes('image/png', 256);
-    const uploaded = (await (
-      await upload({ token: 'valid-admin', bytes })
-    ).json()) as Record<string, unknown>;
+  it('fails with 503 when Cloudinary is not configured', async () => {
+    const saved = {
+      cloud: process.env['CLOUDINARY_CLOUD_NAME'],
+      key: process.env['CLOUDINARY_API_KEY'],
+      secret: process.env['CLOUDINARY_API_SECRET'],
+    };
+    delete process.env['CLOUDINARY_CLOUD_NAME'];
+    delete process.env['CLOUDINARY_API_KEY'];
+    delete process.env['CLOUDINARY_API_SECRET'];
+    try {
+      const response = await upload({
+        token: 'valid-admin',
+        bytes: imageBytes('image/png'),
+      });
+      expect(response.status).toBe(503);
+      const body = (await response.json()) as { error: { code: string } };
+      expect(body.error.code).toBe('server_not_configured');
+      expect(uploadMock).not.toHaveBeenCalled();
+    } finally {
+      if (saved.cloud !== undefined) process.env['CLOUDINARY_CLOUD_NAME'] = saved.cloud;
+      if (saved.key !== undefined) process.env['CLOUDINARY_API_KEY'] = saved.key;
+      if (saved.secret !== undefined)
+        process.env['CLOUDINARY_API_SECRET'] = saved.secret;
+    }
+  });
 
-    const response = await fetch(
-      `${base}/uploads/${uploaded['fileName'] as string}`
-    );
-    expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toContain('image/png');
-    expect(
-      response.headers.get('cross-origin-resource-policy')
-    ).toBe('cross-origin');
-    const served = Buffer.from(await response.arrayBuffer());
-    expect(served.equals(bytes)).toBe(true);
+  it('fails with 500 upload_failed when Cloudinary rejects the upload', async () => {
+    uploadMock.mockRejectedValueOnce(new Error('cloud down'));
+    const response = await upload({
+      token: 'valid-admin',
+      bytes: imageBytes('image/png'),
+    });
+    expect(response.status).toBe(500);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('upload_failed');
+  });
+
+  it('still serves historical local files at GET /uploads/<file>', async () => {
+    const bytes = imageBytes('image/png', 64);
+    const legacyName = `legacy-${Date.now()}.png`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, legacyName), bytes);
+    try {
+      const response = await fetch(`${base}/uploads/${legacyName}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('image/png');
+      expect(
+        response.headers.get('cross-origin-resource-policy')
+      ).toBe('cross-origin');
+      const served = Buffer.from(await response.arrayBuffer());
+      expect(served.equals(bytes)).toBe(true);
+    } finally {
+      fs.rmSync(path.join(UPLOAD_DIR, legacyName), { force: true });
+    }
   });
 
   it('returns 404 for an unknown uploaded image', async () => {
