@@ -34,5 +34,3 @@ coverage/
 Thumbs.db
 
 # Runtime uploads (when the local image-upload endpoint is implemented)
-uploads/
-public/uploads/
