@@ -50,7 +50,11 @@ service cloud.firestore {
     // Clients may NOT create orders — order prices/totals must be computed by
     // the trusted backend (POST /api/orders), which uses the Admin SDK and is
     // not affected by this rule. Only admins (or the backend) may change
-    // orderStatus / paymentStatus, so customers cannot alter statuses.
+    // orderStatus / paymentStatus / gcashDetails / paymentDecision /
+    // paymentAudit, so customers cannot mark payments paid, edit submitted
+    // GCash details after the fact, or tamper with the audit trail — all
+    // payment state changes go through the trusted backend endpoints
+    // (POST /api/orders/:id/gcash-details, POST /api/admin/orders/:id/payment).
     match /orders/{orderId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());
@@ -59,8 +63,10 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // payments: private. Only the backend creates payment records (PayMongo
-    // integration, not yet implemented) and only admins may change a status.
+    // payments: private. Reserved for future backend-managed payment records
+    // (manual GCash verification lives on the order document itself; there is
+    // no payment gateway, webhook, or automated processing). Only the backend
+    // creates payment records and only admins may change a status.
     match /payments/{paymentId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());

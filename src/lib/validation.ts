@@ -2,7 +2,18 @@ import { FieldIssue, badRequest } from '../errors';
 import { roundMoney } from './money';
 
 export type ProductSize = 'small' | 'medium' | 'large';
-export type PaymentMethod = 'COD' | 'ONLINE';
+/**
+ * Payment methods accepted on order creation.
+ *
+ * - `COD` — cash on delivery (unchanged behaviour).
+ * - `GCASH` — manual GCash verification by an admin (see docs/API_CONTRACT.md).
+ * - `ONLINE` — legacy inert value kept for backward compatibility with older
+ *   clients. It is stored as-is but can never use the GCash verification
+ *   endpoints; new clients must send `GCASH` instead.
+ *
+ * Unknown values are rejected — they are never silently treated as COD.
+ */
+export type PaymentMethod = 'COD' | 'ONLINE' | 'GCASH';
 export type OrderStatus =
   | 'PENDING'
   | 'CONFIRMED'
@@ -328,8 +339,12 @@ export function validateCreateOrderRequest(body: unknown): CreateOrderRequest {
   // payment method
   const paymentMethodRaw = source['paymentMethod'];
   let paymentMethod: PaymentMethod = 'COD';
-  if (paymentMethodRaw !== 'COD' && paymentMethodRaw !== 'ONLINE') {
-    issues.add('paymentMethod', 'paymentMethod must be COD or ONLINE.');
+  if (
+    paymentMethodRaw !== 'COD' &&
+    paymentMethodRaw !== 'ONLINE' &&
+    paymentMethodRaw !== 'GCASH'
+  ) {
+    issues.add('paymentMethod', 'paymentMethod must be COD, ONLINE or GCASH.');
   } else {
     paymentMethod = paymentMethodRaw;
   }
@@ -713,6 +728,164 @@ export function readContactMessageId(raw: string): string {
     ]);
   }
   return messageId;
+}
+
+/**
+ * Payment lifecycle for manual GCash verification (stored on the order doc).
+ *
+ * - `PENDING` — initial status for every new order (COD and GCash alike).
+ * - `VERIFYING` — the customer submitted GCash details; awaiting admin review.
+ * - `PAID` — an admin confirmed the payment (terminal).
+ * - `REJECTED` — an admin rejected the payment; the customer may resubmit,
+ *   which moves the order back to `VERIFYING`.
+ *
+ * COD orders never leave `PENDING`. Confirming payment never changes the
+ * separate fulfilment field `orderStatus`.
+ */
+export type PaymentStatus = 'PENDING' | 'VERIFYING' | 'PAID' | 'REJECTED';
+
+/** Decisions an admin may record on a GCash payment. */
+export type PaymentDecision = 'PAID' | 'REJECTED';
+
+export const PAYMENT_DECISIONS: PaymentDecision[] = ['PAID', 'REJECTED'];
+
+/** Maximum accepted lengths for the GCash payment-detail fields. */
+export const GCASH_ACCOUNT_NAME_MIN = 2;
+export const GCASH_ACCOUNT_NAME_MAX = 80;
+
+export interface GcashDetailsInput {
+  /** Trimmed account name (whitespace collapsed). Never proves payment. */
+  accountName: string;
+  /** Philippine mobile number normalized to local `09XXXXXXXXX` form. */
+  accountNumber: string;
+}
+
+/**
+ * Normalizes a Philippine mobile number to local `09XXXXXXXXX` form.
+ *
+ * Accepted inputs (ignoring spaces, hyphens, dots and parentheses):
+ * `09XXXXXXXXX`, `639XXXXXXXXX` and `+639XXXXXXXXX`. Anything else —
+ * landlines, short codes, non-PH numbers, letters — returns null.
+ */
+export function normalizeGcashNumber(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const compact = raw.trim().replace(/[\s\-().]/g, '');
+  if (!/^(?:\+?63|0)9\d{9}$/.test(compact)) {
+    return null;
+  }
+  if (compact.startsWith('+63')) {
+    return `0${compact.slice(3)}`;
+  }
+  if (compact.startsWith('63')) {
+    return `0${compact.slice(2)}`;
+  }
+  return compact;
+}
+
+/**
+ * Validates POST /api/orders/:id/gcash-details bodies.
+ *
+ * Only `accountName` and `accountNumber` are read — any other properties
+ * (totals, statuses, `pin`/`otp`/`password` or other credentials) are ignored
+ * and never trusted. GCash credentials must never be sent; this endpoint has
+ * no fields for them.
+ */
+export function validateGcashDetails(body: unknown): GcashDetailsInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const accountName = readString(source, 'accountName', issues, {
+    required: true,
+    min: GCASH_ACCOUNT_NAME_MIN,
+    max: GCASH_ACCOUNT_NAME_MAX,
+  });
+
+  const numberRaw = source['accountNumber'];
+  let accountNumber: string | null = null;
+  if (typeof numberRaw !== 'string' || numberRaw.trim() === '') {
+    issues.add('accountNumber', 'accountNumber is required.');
+  } else {
+    const normalized = normalizeGcashNumber(numberRaw);
+    if (normalized === null) {
+      issues.add(
+        'accountNumber',
+        'accountNumber must be a valid Philippine mobile number (e.g. 09171234567).'
+      );
+    } else {
+      accountNumber = normalized;
+    }
+  }
+
+  issues.throwIfAny('The GCash payment details are invalid.');
+
+  // Collapse internal whitespace so equivalent names compare equal.
+  const collapsed = (accountName ?? '').replace(/\s+/g, ' ').trim();
+  return { accountName: collapsed, accountNumber: accountNumber ?? '' };
+}
+
+/** Validates POST /api/admin/orders/:id/payment bodies. */
+export function validatePaymentDecision(body: unknown): PaymentDecision {
+  const source = asObject(body);
+  const raw = source['decision'];
+  if (typeof raw !== 'string' || !PAYMENT_DECISIONS.includes(raw as PaymentDecision)) {
+    throw badRequest('decision must be one of: PAID, REJECTED.');
+  }
+  return raw as PaymentDecision;
+}
+
+/**
+ * Refund lifecycle for cancelled orders whose payment was confirmed as PAID.
+ * Stored on the order document as `refund.status` — independent of the
+ * `paymentStatus` field (which stays `PAID`; a refund is returned money, not
+ * a payment-state change):
+ *
+ * - `NOT_REFUNDED` — default for every order; no refund recorded yet.
+ * - `REFUND_PENDING` — an admin opened a refund; the money has not been sent.
+ * - `REFUNDED` — an admin explicitly confirmed the money was actually sent.
+ */
+export type RefundStatus = 'NOT_REFUNDED' | 'REFUND_PENDING' | 'REFUNDED';
+
+export const REFUND_STATUSES: RefundStatus[] = [
+  'NOT_REFUNDED',
+  'REFUND_PENDING',
+  'REFUNDED',
+];
+
+/** Admin actions accepted on the refund endpoint. */
+export type RefundAction = 'PENDING' | 'COMPLETE';
+
+export const REFUND_ACTIONS: RefundAction[] = ['PENDING', 'COMPLETE'];
+
+export interface RefundActionInput {
+  action: RefundAction;
+  /**
+   * Explicit admin confirmation that the money was actually sent back. Only
+   * required (and only meaningful) for `COMPLETE` — starting a refund never
+   * needs it and never marks the refund completed.
+   */
+  confirmed: boolean;
+}
+
+/** Validates POST /api/admin/orders/:id/refund bodies. */
+export function validateRefundAction(body: unknown): RefundActionInput {
+  const source = asObject(body);
+  const raw = source['action'];
+  if (
+    typeof raw !== 'string' ||
+    !REFUND_ACTIONS.includes(raw as RefundAction)
+  ) {
+    throw badRequest('action must be one of: PENDING, COMPLETE.');
+  }
+  const action = raw as RefundAction;
+  const confirmed = source['confirmed'] === true;
+  if (action === 'COMPLETE' && !confirmed) {
+    throw badRequest(
+      'Recording a completed refund requires explicit confirmation: set "confirmed" to true.'
+    );
+  }
+  return { action, confirmed };
 }
 
 /** Validates POST /api/admin/orders/:id/status body. */

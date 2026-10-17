@@ -22,6 +22,8 @@ prefix (the router is mounted at both `/api` and `/` for serverless hosts);
 | Prices | Clients **never** send prices. Totals are computed server-side from Firestore product records |
 
 Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
+`POST /api/orders/:id/cancel` 20/min;
+`POST /api/orders/:id/gcash-details` 20/min;
 `POST /api/contact-messages` 10/min; `GET /api/products*` 120/min;
 `/api/admin/*` 60/min; `POST /api/admin/uploads`
 and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
@@ -38,6 +40,10 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | GET | `/api/products/:id` | — (public) | Single product or `404 product_not_found` |
 | POST | `/api/orders` | Bearer (any signed-in user) | Creates an order; prices computed server-side |
 | GET | `/api/orders/:id` | Bearer (owner or admin) | Others get `404 order_not_found` (no id probing) |
+| POST | `/api/orders/:id/cancel` | Bearer (order owner) | Cancel a `PENDING` order (sets `orderStatus: CANCELLED`, never deletes) → full order (§4) |
+| POST | `/api/orders/:id/gcash-details` | Bearer (order owner) | Submit GCash details for manual verification → `{ id, paymentStatus }` (§4) |
+| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment → `{ id, paymentStatus }` (§4) |
+| POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` (§4) |
 | POST | `/api/contact-messages` | Bearer (any signed-in user) | Stores a "Contact Us" submission → `201 { id, status }` (§4) |
 | POST | `/api/admin/products` | Bearer (admin) | Create product → `201 { id }` |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
@@ -151,9 +157,18 @@ switch to the snippet above.)
   "customer":  { "name": "Juan dela Cruz", "phone": "09171234567" },
   "address":   { "recipientName": "…", "phone": "…", "address": "…", "city": "?", "postalCode": "?" },
   "customerComment": "…",
-  "paymentMethod": "COD" | "ONLINE"
+  "paymentMethod": "COD" | "GCASH" | "ONLINE"
 }
 ```
+
+- `COD` — cash on delivery (unchanged behaviour; never needs payment details).
+- `GCASH` — manual GCash verification by an admin (this section below).
+  There is no payment gateway, QR storage, webhook, or automatic
+  processing — an admin confirms the payment by hand in the backend.
+- `ONLINE` — legacy inert value kept for older clients. It is stored as-is
+  but can never use the GCash verification endpoints below; new clients must
+  send `GCASH`. Unknown values are rejected (`400 invalid_request`) and are
+  never silently treated as COD.
 
 - **No price fields are accepted** — send `productId`/`size`/`sugar`/`quantity` only.
 - Limits: 1–50 items, quantity integer 1–99.
@@ -185,15 +200,175 @@ switch to the snippet above.)
 Full stored order: `id`, `customerId`, `customerSnapshot`, `addressSnapshot`,
 `items` (with purchase-time `unitPrice`/`subtotal` snapshots), `subtotal`,
 `deliveryFee`, `total`, `currency`, `customerComment`, `paymentMethod`,
-`paymentStatus`, `orderStatus`, `createdAt`, `updatedAt`.
+`paymentStatus`, `gcashDetails` (`null` when none submitted yet),
+`refund` (`{ status, amount, requestedAt, completedAt }` refund facts — see
+"Manual refunds"; `NOT_REFUNDED` unless a refund was recorded),
+`orderStatus`, `createdAt`, `updatedAt`.
 Historical orders are returned **exactly as stored** — prices are never
-recomputed or rewritten.
+recomputed or rewritten, and orders without the newer GCash/refund fields come
+back with `gcashDetails: null` and `refund: NOT_REFUNDED`.
+Administrators additionally receive `paymentDecision` (latest admin decision
+with `decidedBy`/`decidedAt`), `paymentAudit` (append-only status trail) and
+`refundAudit` (append-only refund trail); these fields are omitted from
+customer responses.
 
 ### Status graph (admin only)
 
 `PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; `CANCELLED` reachable
 from every non-terminal state. Re-sending the current status is an
 idempotent no-op; anything else → `400 invalid_status_transition`.
+
+### Customer order cancellation
+
+**POST /api/orders/:id/cancel** (order owner only, 20/min/IP, no request body).
+
+A customer may cancel only while the order is still awaiting confirmation
+(`orderStatus: PENDING`). The order document is **never deleted**: the server
+sets `orderStatus` to `CANCELLED` and leaves the independent `paymentStatus`
+(and any submitted `gcashDetails`) untouched. The updated order is returned in
+the same shape as `GET /api/orders/:id`.
+
+```jsonc
+// response 200 — same shape as GET /api/orders/:id
+{ "id": "…", "orderStatus": "CANCELLED", "paymentStatus": "PENDING", /* … */ }
+```
+
+- Cancelling an order that is already `CANCELLED` is an idempotent no-op that
+  returns the order unchanged.
+- Errors: `401 unauthorized` (no/bad token); `404 order_not_found` (missing
+  order, or owned by someone else — administrators are not owners and cancel
+  via `POST /api/admin/orders/:id/status` instead, so they also get `404` here);
+  `409 order_not_cancellable` (order already `CONFIRMED`/`PREPARING`/`READY`/
+  `COMPLETED`).
+- Runs in a Firestore transaction, so a cancellation racing an admin
+  confirmation cannot overwrite the confirmed state.
+
+### Manual GCash verification (no gateway)
+
+The GCash QR image lives in the mobile app assets (not in this backend).
+The flow is: customer pays via their own GCash app → submits their GCash
+account name + mobile number here for reference → an admin verifies the
+payment out-of-band and records the decision here. The submitted name never
+proves payment; only an admin decision marks an order `PAID`.
+
+**Payment-status transitions** (`paymentStatus` is independent of the
+fulfilment field `orderStatus`; confirming payment never completes an order):
+
+| From | To | By | Notes |
+| --- | --- | --- | --- |
+| `PENDING` | `VERIFYING` | customer (`POST …/gcash-details`) | first submission |
+| `VERIFYING` | `VERIFYING` | customer | safe resubmission; latest details win |
+| `REJECTED` | `VERIFYING` | customer | resubmission after a rejection |
+| `VERIFYING` | `PAID` | admin (`POST …/payment`) | confirmation |
+| `VERIFYING` | `REJECTED` | admin | rejection |
+| `PAID` | `PAID` | admin | idempotent no-op (writes nothing) |
+| `REJECTED` | `REJECTED` | admin | idempotent no-op (writes nothing) |
+
+Anything else is rejected: `PAID` can never be overwritten, `REJECTED` can
+only become `PAID` after the customer resubmits (never directly), and an
+admin cannot decide before details exist (`409 payment_details_required`).
+A customer can never mark an order `PAID` — there is no customer-facing
+endpoint that writes `PAID`.
+
+**Customer — POST /api/orders/:id/gcash-details** (owner only, 20/min/IP):
+
+```jsonc
+// request — only these two fields are read; totals, statuses and any
+// pin/otp/password fields are ignored. Never send account credentials.
+{ "accountName": "Juan dela Cruz", "accountNumber": "09171234567" }
+// response 200
+{ "id": "…", "paymentStatus": "VERIFYING",
+  "gcashDetails": { "accountName": "Juan dela Cruz", "accountNumber": "09171234567" } }
+```
+
+- `accountName`: trimmed, internal whitespace collapsed, 2–80 chars.
+- `accountNumber`: Philippine mobile — `09XXXXXXXXX`, `639XXXXXXXXX` or
+  `+639XXXXXXXXX` (spaces/hyphens/parens/dots ignored) — always stored and
+  returned normalized to `09XXXXXXXXX`.
+- Errors: `401 unauthorized` (no/bad token); `404 order_not_found`
+  (missing order, or owned by someone else); `400 invalid_request` (bad
+  name/number, per-field `details`); `409 invalid_payment_method`
+  (non-GCash order, e.g. COD); `409 payment_already_confirmed` (already
+  `PAID`).
+
+**Admin — POST /api/admin/orders/:id/payment** (admin only, 60/min/IP):
+
+```jsonc
+// request — only PAID and REJECTED are accepted
+{ "decision": "PAID" }
+// response 200
+{ "id": "…", "paymentStatus": "PAID" }
+```
+
+- The order must use `GCASH` and be `VERIFYING` with submitted details.
+- The admin UID and decision timestamp are stored (`paymentDecision`) and an
+  entry is appended to `paymentAudit`; `orderStatus` is never changed here.
+- All writes run in a Firestore transaction, so repeated or concurrent
+  identical decisions stay consistent (the repeat is a no-op).
+- Errors: `401 unauthorized`; `403 forbidden` (non-admin);
+  `404 order_not_found`; `400 invalid_request` (bad `decision`);
+  `409 invalid_payment_method` (non-GCash order);
+  `409 payment_details_required` (still `PENDING`);
+  `409 invalid_payment_transition` (overwriting `PAID`, or `REJECTED → PAID`
+  without a customer resubmission).
+
+### Manual refunds (no gateway)
+
+When a **cancelled** order (`orderStatus: CANCELLED`) had an already confirmed
+payment (`paymentStatus: PAID`), an administrator returns the money
+out-of-band (e.g. through their own GCash app) and records the actual outcome
+here. Refund state lives on the order document as `refund.status` and is
+independent of `paymentStatus` (which stays `PAID`):
+
+- `NOT_REFUNDED` — default; every legacy/historic order reads as this.
+- `REFUND_PENDING` — an admin opened a refund; money not sent yet.
+- `REFUNDED` — an admin explicitly confirmed the money was actually sent.
+
+**Refund transitions** (all admin-only, in a Firestore transaction):
+
+| From | To | Action | Notes |
+| --- | --- | --- | --- |
+| `NOT_REFUNDED` | `REFUND_PENDING` | admin (`POST …/refund` `{ "action": "PENDING" }`) | opens the refund; stores the amount + admin uid + timestamp |
+| `REFUND_PENDING` | `REFUND_PENDING` | admin | repeating `PENDING` is an idempotent no-op (writes nothing) |
+| `REFUND_PENDING` | `REFUNDED` | admin (`{ "action": "COMPLETE", "confirmed": true }`) | requires the explicit `confirmed` flag — never set by merely clicking again |
+| `NOT_REFUNDED` | `REFUNDED` | — | refused: record it as pending first (`409 invalid_refund_transition`) |
+| `REFUNDED` | anything | — | refused for good: an order can be refunded exactly once (`409 refund_already_completed`) |
+
+Starting a refund never marks it completed, and no client-supplied amount is
+trusted: the recorded `refund.amount` equals the order's stored paid `total`
+at the time the refund was opened. Refund transitions are appended to a
+separate admin-only `refundAudit` trail (`{ from, to, actorUid, actorRole }`)
+per order — the existing `paymentAudit` and `paymentDecision` are never
+modified, and `orderStatus` / `paymentStatus` are never changed by a refund.
+
+**Admin — POST /api/admin/orders/:id/refund** (admin only, 60/min/IP, same
+bucket as the other admin order endpoints):
+
+```jsonc
+// request — start a pending refund
+{ "action": "PENDING" }
+// request — after the money was actually sent back
+{ "action": "COMPLETE", "confirmed": true }
+// response 200 — the updated order, same shape as GET /api/orders/:id plus
+// the admin-only fields
+{ "id": "…", "refund": { "status": "REFUND_PENDING", "amount": 215,
+                         "requestedAt": "…", "completedAt": null } /* … */ }
+```
+
+- Eligibility: the order must be `CANCELLED` **and** `PAID`; anything else →
+  `409 order_not_refundable`.
+- Errors: `401 unauthorized` (no/bad token); `403 forbidden` (non-admin);
+  `404 order_not_found`; `400 invalid_request` (`action` missing/unknown, or
+  `COMPLETE` without `confirmed: true`); `409 order_not_refundable`;
+  `409 invalid_refund_transition` (completing a refund that was never opened);
+  `409 refund_already_completed` (another completed refund already exists).
+
+**Customer visibility:** `GET /api/orders/:id` (and every response that uses
+the order shape) now includes a `refund` object — `{ status, amount,
+requestedAt, completedAt }` — so mobile clients can show refund progress.
+The customer `refund` object is null-amount `NOT_REFUNDED` for orders never
+refunded, and never includes admin notes or the admin-only `refundAudit`
+trail (which administrators additionally receive).
 
 ### Contact messages — POST /api/contact-messages
 
@@ -314,7 +489,7 @@ store) as a future setup step; no email is sent or claimed today.
 | --- | --- | --- |
 | `products` | **anyone** (public catalog) | none — use `/api/admin/products` |
 | `users/{uid}` | self or admin | self (role preserved), or use the API |
-| `orders` | own orders or admin | **denied** — create only via `POST /api/orders`; status changes admin-only via the API |
+| `orders` | own orders or admin | **denied** — create only via `POST /api/orders`; GCash details only via `POST /api/orders/:id/gcash-details` (owner); status/payment decisions admin-only via the API |
 | `payments` | own or admin | **denied** — backend-managed (PayMongo not yet implemented) |
 | `contactMessages` | **denied** (everyone, admins included) | **denied** — create only via `POST /api/contact-messages` (Admin SDK) |
 
@@ -474,9 +649,12 @@ and are never rewritten by reads or by new uploads.
 - **Firebase Storage** — not used. Permanent image hosting is Cloudinary
   (§6); the remaining local-disk surface is read-only legacy serving of
   historical `GET /uploads/<file>` files only.
-- PayMongo payments (no payment endpoint/webhook; `paymentMethod: "ONLINE"`
-  is stored but inert; `paymentStatus` only changes through admin status
-  updates).
+- Payment gateways (no PayMongo/Adyen/Ezypay/GCash APIs, webhooks, automated
+  checks, or real payment processing). GCash is manual verification only
+  (§4): `paymentMethod: "GCASH"` with customer-submitted details and an admin
+  `PAID`/`REJECTED` decision; the legacy `paymentMethod: "ONLINE"` value is
+  stored but inert and cannot use the verification endpoints. There is no
+  QR display or QR storage in this backend.
 - Admin order list endpoint (`GET /api/admin/orders` does not exist; use
   Firestore reads, which are admin-allowed, until it does).
 - Email notifications for contact messages (no email provider is configured;
