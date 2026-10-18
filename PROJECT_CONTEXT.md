@@ -73,7 +73,7 @@ Request (`src/lib/validation.ts:185-321`):
   "customer":  { "name": "…", "phone": "…" },
   "address":   { "recipientName": "…", "phone": "…", "address": "…", "city": "?", "postalCode": "?" },
   "customerComment": "…",
-  "paymentMethod": "COD" | "ONLINE"
+  "paymentMethod": "COD" | "GCASH"
 }
 ```
 **No prices are accepted from the client.** Limits: ≤50 items, quantity 1–99.
@@ -113,7 +113,7 @@ customerSnapshot{uid,name,email,phone},
 addressSnapshot{recipientName,phone,address,city?,postalCode?},
 items[{productId,productName,imageUrl,size,sugar,quantity,unitPrice,subtotal}],
 subtotal, deliveryFee, total, customerComment,
-paymentMethod: 'COD'|'ONLINE', paymentStatus: 'PENDING', orderStatus: 'PENDING',
+paymentMethod: 'COD'|'GCASH', paymentStatus: 'PENDING', orderStatus: 'PENDING',
 createdAt, updatedAt
 ```
 
@@ -225,7 +225,7 @@ Tests need no network or credentials (Firebase is mocked in `src/app.test.ts:5-1
 | Admin order management | ⚠️ **PARTIAL** | Status transition exists; **no order list/detail endpoint** for admins |
 | Localhost image uploads (dev) | ✅ **WORKS** (added after this audit) | `POST /api/admin/uploads` (admin-only, multer, magic-byte type check, 5 MB cap, rate-limited) + `GET /uploads/:file`; storage in `UPLOAD_DIR` (git-ignored). See §12, `README.md`, `docs/API_CONTRACT.md` §6 |
 | Firebase Storage (production) | ❌ **MISSING** | No `getStorage`/`bucket()` usage, no bucket env var |
-| PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'ONLINE'` is stored but inert (`src/services/orders.service.ts:89`) |
+| PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'GCASH'` is manual verification only (`src/services/orders.service.ts:89`) |
 | Secrets server-side | ✅ **WORKS** | No secrets in repo; `.env.example` placeholders empty |
 | Vercel deployment readiness | ⚠️ **PARTIAL** | `api/index.ts` serverless wrapper + dual mounting exist; **no `vercel.json`**, self-declared "PREPARED BUT UNVERIFIED" (`api/index.ts:7-10`), never deployed |
 | Public product browsing before login | ⚠️ **BLOCKED BY RULES** | `firestore.rules:43` requires `isSignedIn()` for `products` read; there is also no public `GET /api/products`. Enabling guest browsing needs a deliberate rules change or a public endpoint |

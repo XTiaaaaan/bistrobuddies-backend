@@ -7,13 +7,10 @@ export type ProductSize = 'small' | 'medium' | 'large';
  *
  * - `COD` — cash on delivery (unchanged behaviour).
  * - `GCASH` — manual GCash verification by an admin (see docs/API_CONTRACT.md).
- * - `ONLINE` — legacy inert value kept for backward compatibility with older
- *   clients. It is stored as-is but can never use the GCash verification
- *   endpoints; new clients must send `GCASH` instead.
  *
  * Unknown values are rejected — they are never silently treated as COD.
  */
-export type PaymentMethod = 'COD' | 'ONLINE' | 'GCASH';
+export type PaymentMethod = 'COD' | 'GCASH';
 export type OrderStatus =
   | 'PENDING'
   | 'CONFIRMED'
@@ -339,12 +336,8 @@ export function validateCreateOrderRequest(body: unknown): CreateOrderRequest {
   // payment method
   const paymentMethodRaw = source['paymentMethod'];
   let paymentMethod: PaymentMethod = 'COD';
-  if (
-    paymentMethodRaw !== 'COD' &&
-    paymentMethodRaw !== 'ONLINE' &&
-    paymentMethodRaw !== 'GCASH'
-  ) {
-    issues.add('paymentMethod', 'paymentMethod must be COD, ONLINE or GCASH.');
+  if (paymentMethodRaw !== 'COD' && paymentMethodRaw !== 'GCASH') {
+    issues.add('paymentMethod', 'paymentMethod must be COD or GCASH.');
   } else {
     paymentMethod = paymentMethodRaw;
   }

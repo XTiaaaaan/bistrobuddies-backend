@@ -157,7 +157,7 @@ switch to the snippet above.)
   "customer":  { "name": "Juan dela Cruz", "phone": "09171234567" },
   "address":   { "recipientName": "…", "phone": "…", "address": "…", "city": "?", "postalCode": "?" },
   "customerComment": "…",
-  "paymentMethod": "COD" | "GCASH" | "ONLINE"
+  "paymentMethod": "COD" | "GCASH"
 }
 ```
 
@@ -165,9 +165,7 @@ switch to the snippet above.)
 - `GCASH` — manual GCash verification by an admin (this section below).
   There is no payment gateway, QR storage, webhook, or automatic
   processing — an admin confirms the payment by hand in the backend.
-- `ONLINE` — legacy inert value kept for older clients. It is stored as-is
-  but can never use the GCash verification endpoints below; new clients must
-  send `GCASH`. Unknown values are rejected (`400 invalid_request`) and are
+  Unknown values are rejected (`400 invalid_request`) and are
   never silently treated as COD.
 
 - **No price fields are accepted** — send `productId`/`size`/`sugar`/`quantity` only.
@@ -652,8 +650,7 @@ and are never rewritten by reads or by new uploads.
 - Payment gateways (no PayMongo/Adyen/Ezypay/GCash APIs, webhooks, automated
   checks, or real payment processing). GCash is manual verification only
   (§4): `paymentMethod: "GCASH"` with customer-submitted details and an admin
-  `PAID`/`REJECTED` decision; the legacy `paymentMethod: "ONLINE"` value is
-  stored but inert and cannot use the verification endpoints. There is no
+  `PAID`/`REJECTED` decision. There is no
   QR display or QR storage in this backend.
 - Admin order list endpoint (`GET /api/admin/orders` does not exist; use
   Firestore reads, which are admin-allowed, until it does).

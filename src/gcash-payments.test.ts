@@ -232,14 +232,6 @@ describe('manual GCash verification', () => {
           paymentStatus: 'PENDING',
         }),
       ],
-      [
-        'o-online',
-        gcashOrder({
-          id: 'o-online',
-          paymentMethod: 'ONLINE',
-          paymentStatus: 'PENDING',
-        }),
-      ],
       // Historical order: predates GCash fields entirely.
       [
         'h-old',
@@ -482,7 +474,7 @@ describe('manual GCash verification', () => {
       expect(get.status).toBe(404);
     });
 
-    it('rejects COD and legacy ONLINE orders', async () => {
+    it('rejects COD orders', async () => {
       const cod = await submitDetails('c-cod', 'valid-customer', {
         accountName: 'Juan dela Cruz',
         accountNumber: '09171234567',
@@ -491,12 +483,6 @@ describe('manual GCash verification', () => {
       expect(((await cod.json()) as { error: { code: string } }).error.code).toBe(
         'invalid_payment_method'
       );
-
-      const online = await submitDetails('o-online', 'valid-customer', {
-        accountName: 'Juan dela Cruz',
-        accountNumber: '09171234567',
-      });
-      expect(online.status).toBe(409);
     });
 
     it('returns 404 for a missing order', async () => {
@@ -772,7 +758,7 @@ describe('manual GCash verification', () => {
       expect(summary['paymentStatus']).toBe('PENDING');
     });
 
-    it('accepts GCASH and legacy ONLINE on creation but rejects unknown methods', async () => {
+    it('accepts GCASH on creation but rejects unknown methods', async () => {
       async function createWith(paymentMethod: string) {
         return fetch(`${base}/api/orders`, {
           method: 'POST',
@@ -797,7 +783,7 @@ describe('manual GCash verification', () => {
       }
 
       expect((await createWith('GCASH')).status).toBe(201);
-      expect((await createWith('ONLINE')).status).toBe(201);
+      expect((await createWith('ONLINE')).status).toBe(400);
       expect((await createWith('BITCOIN')).status).toBe(400);
     });
   });
