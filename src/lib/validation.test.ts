@@ -3,9 +3,11 @@ import { ApiError, FieldIssue } from '../errors';
 import {
   CONTACT_MESSAGES_DEFAULT_PAGE_SIZE,
   CONTACT_MESSAGES_MAX_PAGE_SIZE,
+  CONTACT_REPLY_MAX,
   allowedNextStatuses,
   readContactMessageId,
   readContactMessageListQuery,
+  validateContactMessageReply,
   validateContactMessageRequest,
   validateContactMessageStatusUpdate,
   validateCreateOrderRequest,
@@ -426,8 +428,53 @@ describe('validateContactMessageRequest', () => {
   });
 });
 
-describe('validateContactMessageStatusUpdate', () => {
-  it('accepts READ and RESOLVED', () => {
+describe('validateContactMessageReply', () => {
+  it('trims and accepts a valid reply', () => {
+    expect(validateContactMessageReply({ reply: '  We shipped it today.  ' })).toEqual({
+      reply: 'We shipped it today.',
+    });
+  });
+
+  it('rejects missing, empty and whitespace-only replies', () => {
+    for (const body of [{}, { reply: '' }, { reply: '  \n\t ' }, { reply: null }]) {
+      expectFieldIssues(() => validateContactMessageReply(body), /reply/);
+    }
+  });
+
+  it('rejects non-string replies', () => {
+    expectFieldIssues(
+      () => validateContactMessageReply({ reply: 42 }),
+      /reply/
+    );
+  });
+
+  it('rejects replies longer than the maximum', () => {
+    expectFieldIssues(
+      () => validateContactMessageReply({ reply: 'r'.repeat(CONTACT_REPLY_MAX + 1) }),
+      /reply/
+    );
+  });
+
+  it('ignores client-supplied identity fields entirely', () => {
+    const result = validateContactMessageReply({
+      reply: 'Thank you.',
+      senderRole: 'ADMIN',
+      replyId: 'forged',
+      createdAt: '2000-01-01T00:00:00.000Z',
+      userId: 'cust-1',
+    });
+    expect(result).toEqual({ reply: 'Thank you.' });
+    expect(result).not.toHaveProperty('senderRole');
+  });
+
+  it('rejects non-object bodies', () => {
+    expect(() => validateContactMessageReply('text')).toThrow(ApiError);
+    expect(() => validateContactMessageReply(null)).toThrow(ApiError);
+    expect(() => validateContactMessageReply(['reply'])).toThrow(ApiError);
+  });
+});
+
+describe('validateContactMessageStatusUpdate', () => {  it('accepts READ and RESOLVED', () => {
     expect(validateContactMessageStatusUpdate({ status: 'READ' })).toBe('READ');
     expect(validateContactMessageStatusUpdate({ status: 'RESOLVED' })).toBe(
       'RESOLVED'

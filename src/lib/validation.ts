@@ -586,6 +586,38 @@ export function validateContactMessageRequest(body: unknown): ContactMessageInpu
   };
 }
 
+/** Maximum accepted length for an admin reply body. */
+export const CONTACT_REPLY_MAX = 5000;
+
+export interface ContactMessageReplyInput {
+  reply: string;
+}
+
+/**
+ * Validates POST /api/admin/contact-messages/:id/replies bodies.
+ *
+ * Only `reply` is read — any client-supplied `senderRole`, `id` or timestamp
+ * properties are ignored and never trusted; the sender role and timestamps
+ * are decided by the server. The value is trimmed and rejected when
+ * whitespace-only or longer than CONTACT_REPLY_MAX.
+ */
+export function validateContactMessageReply(body: unknown): ContactMessageReplyInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const reply = readString(source, 'reply', issues, {
+    required: true,
+    max: CONTACT_REPLY_MAX,
+  });
+
+  issues.throwIfAny('The reply payload is invalid.');
+
+  return { reply: reply ?? '' };
+}
+
+/** Sender roles stored on a contact-message reply. */
+export type ContactReplySenderRole = 'ADMIN' | 'CUSTOMER';
+
 export type ContactMessageStatus = 'NEW' | 'READ' | 'RESOLVED';
 
 /** Workflow statuses a stored contact message can carry. */

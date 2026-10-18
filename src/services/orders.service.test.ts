@@ -37,6 +37,7 @@ function makeDb(products: ProductDoc[]) {
     collection: (name: string) => ({
       doc: (id?: string) => ({
         id: id ?? 'order-created-1',
+        get: async () => ({ exists: false, data: () => undefined }),
         set: async (payload: Record<string, unknown>) => {
           if (name === 'orders') {
             created.push(payload);

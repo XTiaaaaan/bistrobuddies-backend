@@ -1,4 +1,5 @@
-import { FieldValue } from 'firebase-admin/firestore';
+import { randomInt } from 'node:crypto';
+import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 import { config } from '../config';
 import { ApiError, badRequest, notFound } from '../errors';
 import { requireFirebase } from '../firebase/admin';
@@ -24,6 +25,27 @@ export interface OrderSummary {
   currency: string;
   orderStatus: string;
   paymentStatus: string;
+}
+
+const ORDER_ID_PREFIX = 'bistro';
+const ORDER_ID_DIGITS = 10;
+
+/**
+ * Human readable order id in the form `bistro` + 10 digits
+ * (e.g. `bistro4839201756`). Retries on the unlikely collision.
+ */
+async function nextOrderId(db: Firestore): Promise<string> {
+  for (;;) {
+    const candidate = `${ORDER_ID_PREFIX}${randomInt(
+      0,
+      10 ** ORDER_ID_DIGITS
+    )
+      .toString()
+      .padStart(ORDER_ID_DIGITS, '0')}`;
+    if (!(await db.collection('orders').doc(candidate).get()).exists) {
+      return candidate;
+    }
+  }
 }
 
 interface StoredProduct {
@@ -80,7 +102,7 @@ export async function createOrder(
   const deliveryFee = config.deliveryFee;
   const total = roundMoney(subtotal + deliveryFee);
 
-  const orderRef = db.collection('orders').doc();
+  const orderRef = db.collection('orders').doc(await nextOrderId(db));
   const order = {
     id: orderRef.id,
     customerId: user.uid,

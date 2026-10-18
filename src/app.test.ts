@@ -60,6 +60,13 @@ const state = vi.hoisted(() => {
       collection: (name: string) => ({
         doc: (id?: string) => ({
           id: id ?? 'generated-1',
+          get: async () => {
+            if (name === 'orders') {
+              const data = store.orders.get(id ?? '');
+              return { exists: data !== undefined, data: () => data };
+            }
+            return { exists: false, data: () => undefined };
+          },
           set: async (payload: Record<string, unknown>) => {
             if (name === 'orders') {
               store.createdOrders.push(payload);
@@ -249,7 +256,7 @@ describe('bistrobuddies-backend HTTP API', () => {
       });
       expect(response.status).toBe(201);
       const summary = (await response.json()) as Record<string, unknown>;
-      expect(summary['id']).toBe('generated-1');
+      expect(summary['id']).toMatch(/^bistro\d{10}$/);
       expect(summary['subtotal']).toBe(200);
       expect(summary['total']).toBe(200);
       expect(summary['orderStatus']).toBe('PENDING');

@@ -24,7 +24,8 @@ prefix (the router is mounted at both `/api` and `/` for serverless hosts);
 Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
 `POST /api/orders/:id/cancel` 20/min;
 `POST /api/orders/:id/gcash-details` 20/min;
-`POST /api/contact-messages` 10/min; `GET /api/products*` 120/min;
+`POST /api/contact-messages` 10/min; `GET /api/contact-messages/mine` 60/min;
+`GET /api/products*` 120/min;
 `/api/admin/*` 60/min; `POST /api/admin/uploads`
 and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 `Retry-After` header.
@@ -45,6 +46,7 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment → `{ id, paymentStatus }` (§4) |
 | POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` (§4) |
 | POST | `/api/contact-messages` | Bearer (any signed-in user) | Stores a "Contact Us" submission → `201 { id, status }` (§4) |
+| GET | `/api/contact-messages/mine` | Bearer (any signed-in user) | The caller's own messages, newest first → `{ messages: [...] }` (§4) |
 | POST | `/api/admin/products` | Bearer (admin) | Create product → `201 { id }` |
 | PATCH | `/api/admin/products/:id` | Bearer (admin) | Partial update → `{ id }` |
 | DELETE | `/api/admin/products/:id` | Bearer (admin) | Delete → `{ id }` |
@@ -53,6 +55,7 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Status transition → `{ id, orderStatus }` |
 | GET | `/api/admin/contact-messages` | Bearer (admin) | Customer "Contact Us" messages, newest first; `?status`, `?page`, `?pageSize` (§4) |
 | PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | `{ status: "READ" \| "RESOLVED" }` → `{ id, status }` (§4) |
+| POST | `/api/admin/contact-messages/:id/replies` | Bearer (admin) | `{ reply }` → `201 { id, status, reply }` — appends an admin reply (§4) |
 
 CORS allows `GET, POST, PATCH, DELETE, OPTIONS` from `ALLOWED_ORIGINS`.
 
@@ -405,12 +408,53 @@ credentials → `503 server_not_configured`.
 
 **Storage:** Firestore collection `contactMessages`, document fields `id`,
 `name`, `email`, `subject`, `message`, `userId` (verified token),
-`status` (`NEW` initially), `createdAt`/`updatedAt` (server timestamps).
-Clients have **no** access to this collection (`firestore.rules` denies all
-client reads/writes); there is deliberately **no** GET/PATCH/DELETE endpoint
-on `/api/contact-messages`, so customers can never read, edit or delete
-contact messages through the API. Administrators read messages and change
-their workflow status through the separate, admin-guarded endpoints below.
+`status` (`NEW` initially), `createdAt`/`updatedAt` (server timestamps)
+and `replies` (admin replies appended by the endpoint below). Clients have
+**no** direct access to this collection (`firestore.rules`
+denies all client reads/writes); the only customer read path is the
+owner-scoped `GET /api/contact-messages/mine` endpoint below. There is
+deliberately **no** per-message GET and no PATCH/DELETE endpoint on
+`/api/contact-messages`, so customers can never read, edit or delete another
+customer's message through the API. Administrators read messages, change
+their workflow status and reply through the separate, admin-guarded
+endpoints below.
+
+### Customer — GET /api/contact-messages/mine
+
+The mobile app's **My Messages** screen. Requires `Authorization: Bearer
+<any valid Firebase ID token>`; 60/min/IP.
+
+Ownership is enforced server-side: the Firestore query is scoped to the
+`userId` from the verified token, so a client can never retrieve another
+customer's messages. **No user id is accepted from the request** — a
+`?userId=` query string is ignored. Messages are returned newest first.
+
+**Response `200`:**
+
+```json
+{
+  "messages": [
+    {
+      "id": "…",
+      "subject": "Order question",
+      "message": "…",
+      "status": "NEW",
+      "createdAt": "2026-10-09T12:00:00.000Z",
+      "updatedAt": "2026-10-09T12:00:00.000Z",
+      "replies": []
+    }
+  ]
+}
+```
+
+Only the fields above are returned — the sender `name`, `email` and the
+internal `userId` never leave the server. `replies` holds any stored admin
+replies, oldest first, with only `{ id, senderRole, reply, createdAt }` per
+entry (no identity fields). A customer with no messages gets
+`{ "messages": [] }` (not an error). Missing/invalid token → `401
+unauthorized`; missing server credentials → `503 server_not_configured`.
+Requires no Firestore composite index (single-field `userId` equality, then
+in-memory sort).
 
 ### Admin — GET /api/admin/contact-messages
 
@@ -441,7 +485,8 @@ per-field `details`):
       "message": "…",
       "status": "NEW",
       "createdAt": "2026-10-09T12:00:00.000Z",
-      "updatedAt": "2026-10-09T12:00:00.000Z"
+      "updatedAt": "2026-10-09T12:00:00.000Z",
+      "replies": []
     }
   ],
   "page": 1,
@@ -452,7 +497,8 @@ per-field `details`):
 ```
 
 Only the fields above are returned — the stored `userId` and any other
-document properties never leave the server. Messages on a page beyond
+document properties never leave the server. `replies` holds stored admin
+replies oldest first. Messages on a page beyond
 `totalPages` return an empty `messages` array (not an error).
 
 ### Admin — PATCH /api/admin/contact-messages/:id/status
@@ -472,6 +518,42 @@ changed through this endpoint.
 ```json
 { "id": "<message id>", "status": "READ" }
 ```
+
+### Admin → POST /api/admin/contact-messages/:id/replies
+
+Appends an administrator's reply to a customer message. Same admin guard
+and rate limit as the list/status endpoints — `401 unauthorized` without a
+valid token, `403 forbidden` for non-admin users.
+
+**Request:** `{ "reply": "We found it — shipping tomorrow." }`. Only `reply`
+is read; client-supplied `senderRole`/`id`/timestamps are ignored. The text
+is trimmed and must be 1–5000 characters — `400 invalid_request` otherwise.
+Unknown id → `404 contact_message_not_found`.
+
+**Response `201`:**
+
+```json
+{
+  "id": "<message id>",
+  "status": "READ",
+  "reply": {
+    "id": "<server-generated reply id>",
+    "senderRole": "ADMIN",
+    "reply": "We found it — shipping tomorrow.",
+    "createdAt": "2026-10-09T12:30:00.000Z"
+  }
+}
+```
+
+Replies are stored in the message document's `replies` array with a
+server-generated id, the server-decided `senderRole` (`ADMIN`; `CUSTOMER`
+is reserved for a future flow) and a server-timestamp `createdAt` — only
+the Admin SDK writes them, clients remain denied by `firestore.rules`.
+The write is atomic: `replies`, `updatedAt` and (when applicable) `status`
+are all stored in one update, so a failed write leaves the message
+untouched and never reports success. Replying to a `NEW` message marks it
+`READ`; `RESOLVED` is never applied automatically — an admin chooses that
+explicitly through the status endpoint.
 
 **Email notifications:** not configured in this repository — Firestore
 storage is the reliable submission mechanism. Forwarding new messages to

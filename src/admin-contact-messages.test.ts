@@ -243,10 +243,13 @@ describe('admin contact messages API', () => {
           'id',
           'message',
           'name',
+          'replies',
           'status',
           'subject',
           'updatedAt',
         ]);
+        // A message without replies exposes an empty replies array.
+        expect(message['replies']).toEqual([]);
       }
     });
 
