@@ -1,0 +1,50 @@
+# Render Blueprint for the BistroBuddies trusted backend.
+# Reference: https://render.com/docs/blueprint-spec
+#
+# No secret values are stored here. Every variable marked `sync: false` is
+# prompted for (and stored encrypted) in the Render Dashboard, so credentials
+# never live in this repository. Required values and formats are documented in
+# README.md ("Render deployment").
+services:
+  - type: web
+    name: bistrobuddies-backend
+    runtime: node
+    # Deploy the branch this repository is being prepared on. Update this when
+    # the work is merged into the default branch.
+    branch: BACKEND-BEFORE-DEPLOYMENT
+    # Verified against package.json + tsconfig.json:
+    #   npm run build -> tsc -p tsconfig.json -> dist/src/server.js
+    #   node dist/src/server.js starts the compiled Express server.
+    buildCommand: npm install && npm run build
+    startCommand: node dist/src/server.js
+    # GET /api/health returns 200 { status: "ok", ... } without auth or secrets.
+    healthCheckPath: /api/health
+    # Controlled deployment: do not auto-deploy on every push; deploy manually
+    # from the Render Dashboard.
+    autoDeployTrigger: 'off'
+    envVars:
+      # Trust exactly one proxy hop (Render's edge proxy) so req.ip is the real
+      # client IP for rate limiting. Parsed as boolean by src/config.ts.
+      - key: TRUST_PROXY
+        value: '1'
+      # Comma-separated CORS allowlist. MUST be set for production — the
+      # built-in default only covers localhost + Capacitor development origins.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Firebase Admin credentials: paste the full service-account JSON as a
+      # single (possibly multiline) value. The alternative
+      # GOOGLE_APPLICATION_CREDENTIALS secret-file path can be added manually in
+      # the Dashboard if preferred (see README.md).
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      # Delivery fee in PHP added to every order. Keep in sync with the apps.
+      - key: DELIVERY_FEE
+        sync: false
+      # Cloudinary image storage (server-side only). Required for the product
+      # and profile upload endpoints.
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false

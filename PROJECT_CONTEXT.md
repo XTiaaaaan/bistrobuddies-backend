@@ -1,7 +1,14 @@
 # PROJECT_CONTEXT.md — BistroBuddies Backend (trusted API)
 
-> Generated from a read-only audit of the existing repository. No application code, Firebase settings,
-> or data were changed. Secrets are intentionally not reproduced in this file.
+> Originally generated from a read-only audit of an early version of this repository. No application
+> code, Firebase settings, or data were changed by that audit, and secrets are intentionally not
+> reproduced in this file. Sections §12–§14 are later addenda; **§14 is the current state** (Cloudinary
+> image storage + Render deployment). Where an earlier section contradicts an addendum, the addendum wins.
+
+> **Current state at a glance (verified by running the code):** 13 test files / 264 tests pass;
+> `npm run typecheck`, `npm run lint`, `npm run build` pass; `node dist/src/server.js` serves
+> `GET /api/health` on `PORT`. Images (product + profile) are stored in Cloudinary, not local disk.
+> A `render.yaml` Blueprint is included. The in-memory rate limiter is still single-instance only.
 
 ---
 
@@ -13,17 +20,18 @@ product writes, and (planned) payment/image handling.
 
 | Attribute | Verified value |
 |---|---|
-| Framework | Express 4 (locked 4.22.3) + TypeScript 5.9 (CommonJS) |
-| Firebase | `firebase-admin` 13.10.0 (server SDK) |
-| Other deps | `cors`, `helmet`, `serverless-http` |
-| Test runner | Vitest 4.1.11 (no config file; default glob picks up `*.test.ts`) |
+| Framework | Express 4 + TypeScript 5.9 (CommonJS) |
+| Firebase | `firebase-admin` 13.4.0 (server SDK) |
+| Other deps | `cors`, `helmet`, `multer`, `cloudinary`, `serverless-http` |
+| Test runner | Vitest 4 (no config file; default glob picks up `*.test.ts`) |
 | Package manager | npm (`package-lock.json` lockfileVersion 3) |
 | Node engine | `>=20.12` |
-| Firebase project | `bistrobuddies-4f179` (default in `src/config.ts:80-83`, `.firebaserc`) |
-| Git | 1 commit (`611d3d4 Initial commit: BistroBuddies backend API`), working tree clean, remote `github.com/XTiaaaaan/bistrobuddies-backend` |
+| Firebase project | `bistrobuddies-4f179` (default in `src/config.ts`, `.firebaserc`) |
+| Git | Branch `BACKEND-BEFORE-DEPLOYMENT` (default branch is `main`), remote `github.com/XTiaaaaan/bistrobuddies-backend` |
 
-**Not present (verified):** no `paymongo` package, no `multer`/file-upload package, no `dotenv`
-(uses native `process.loadEnvFile`), no `vercel.json`, no `.env` file, no `dist/` before this audit.
+**Not present (verified):** no `paymongo` package, no `dotenv` (uses native `process.loadEnvFile`),
+no `vercel.json`. A local `.env` and `dist/` build output exist on the development machine but are
+**not tracked** (both `.gitignore`d). Image uploads use `multer` + `cloudinary` (see §14).
 
 ---
 
@@ -51,18 +59,33 @@ Every route exists at both `/api/<path>` and `/<path>` (see §2).
 
 | Method | Path | Handler | Auth | Rate limit |
 |---|---|---|---|---|
-| GET | `/api/health` | `src/routes/health.ts:7` | public | — |
-| POST | `/api/orders` | `src/routes/orders.ts:16` | Bearer (any signed-in user) | 20/min/IP |
-| POST | `/api/admin/products` | `src/routes/admin-products.ts:32` | Bearer + admin | 60/min/IP |
-| PATCH | `/api/admin/products/:id` | `src/routes/admin-products.ts:43` | Bearer + admin | 60/min/IP |
-| DELETE | `/api/admin/products/:id` | `src/routes/admin-products.ts:55` | Bearer + admin | 60/min/IP |
-| POST | `/api/admin/orders/:id/status` | `src/routes/admin-orders.ts:29` | Bearer + admin | 60/min/IP |
+| GET | `/api/health` | `src/routes/health.ts` | public | — |
+| GET | `/api/products` | `src/routes/products.ts` | public | 120/min/IP |
+| GET | `/api/products/:id` | `src/routes/products.ts` | public | 120/min/IP |
+| POST | `/api/orders` | `src/routes/orders.ts` | Bearer (any signed-in user) | 20/min/IP |
+| GET | `/api/orders/:id` | `src/routes/orders.ts` | Bearer (owner or admin) | 120/min/IP |
+| POST | `/api/orders/:id/cancel` | `src/routes/orders.ts` | Bearer (owner) | 20/min/IP |
+| POST | `/api/orders/:id/gcash-details` | `src/routes/orders.ts` | Bearer (owner) | 20/min/IP |
+| POST | `/api/contact-messages` | `src/routes/contact-messages.ts` | Bearer (any signed-in user) | 10/min/IP |
+| GET | `/api/contact-messages/mine` | `src/routes/contact-messages.ts` | Bearer (any signed-in user) | 60/min/IP |
+| POST | `/api/admin/products` | `src/routes/admin-products.ts` | Bearer + admin | 60/min/IP |
+| PATCH | `/api/admin/products/:id` | `src/routes/admin-products.ts` | Bearer + admin | 60/min/IP |
+| DELETE | `/api/admin/products/:id` | `src/routes/admin-products.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/uploads` | `src/routes/admin-uploads.ts` | Bearer + admin | 30/min/IP |
+| POST | `/api/profile/photo` | `src/routes/profile-uploads.ts` | Bearer (any signed-in user) | 30/min/IP |
+| POST | `/api/admin/orders/:id/status` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/orders/:id/payment` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/orders/:id/refund` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
+| GET | `/api/admin/contact-messages` | `src/routes/admin-contact-messages.ts` | Bearer + admin | 60/min/IP |
+| PATCH | `/api/admin/contact-messages/:id/status` | `src/routes/admin-contact-messages.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/contact-messages/:id/replies` | `src/routes/admin-contact-messages.ts` | Bearer + admin | 60/min/IP |
+| GET | `/uploads/:file` | `src/app.ts` (`express.static`) | public read | — (legacy files only) |
 
-**Endpoints that DO NOT exist:** `GET /api/products`, `GET /api/products/:id`,
-`GET /api/admin/orders`, `GET /api/orders`, any webhook, any payment endpoint.
-CORS allows only `GET, POST, PATCH, DELETE, OPTIONS` (`src/app.ts:42`) — there are no `PUT` routes.
-*(A `POST /api/admin/uploads` image-upload endpoint and `GET /uploads/:file`
-static route were added after this audit — see §12.)*
+**Endpoints that DO NOT exist:** `GET /api/admin/orders` (no admin order list),
+`GET /api/orders` (no customer order list), any webhook, any real payment
+gateway. CORS allows only `GET, POST, PATCH, DELETE, OPTIONS` (`src/app.ts`) —
+there are no `PUT` routes. `GET /api/products`/`:id` **do** exist now (<- this
+line corrects the original audit). New image uploads go to Cloudinary; see §14.
 
 ### POST /api/orders — request/response
 
@@ -73,7 +96,7 @@ Request (`src/lib/validation.ts:185-321`):
   "customer":  { "name": "…", "phone": "…" },
   "address":   { "recipientName": "…", "phone": "…", "address": "…", "city": "?", "postalCode": "?" },
   "customerComment": "…",
-  "paymentMethod": "COD" | "ONLINE"
+  "paymentMethod": "COD" | "GCASH"
 }
 ```
 **No prices are accepted from the client.** Limits: ≤50 items, quantity 1–99.
@@ -113,7 +136,7 @@ customerSnapshot{uid,name,email,phone},
 addressSnapshot{recipientName,phone,address,city?,postalCode?},
 items[{productId,productName,imageUrl,size,sugar,quantity,unitPrice,subtotal}],
 subtotal, deliveryFee, total, customerComment,
-paymentMethod: 'COD'|'ONLINE', paymentStatus: 'PENDING', orderStatus: 'PENDING',
+paymentMethod: 'COD'|'GCASH', paymentStatus: 'PENDING', orderStatus: 'PENDING',
 createdAt, updatedAt
 ```
 
@@ -158,16 +181,19 @@ Template: `.env.example`. **No `.env` file exists in the repository.**
 
 | Name | Non-secret default | Purpose |
 |---|---|---|
-| `PORT` | `3001` | HTTP port |
+| `PORT` | `3001` | HTTP port (Render injects it automatically) |
 | `DELIVERY_FEE` | `0` | Delivery fee in PHP added to every order |
 | `FIREBASE_PROJECT_ID` | `bistrobuddies-4f179` | Target Firebase project |
-| `GOOGLE_APPLICATION_CREDENTIALS` | *(empty)* | **Path** to service-account JSON |
-| `FIREBASE_SERVICE_ACCOUNT` | *(empty)* | **Inline** service-account JSON (alternative to the above) |
-| `ALLOWED_ORIGINS` | localhost:4200/8100, `capacitor://localhost`, `https://localhost` | CORS allowlist |
-| `TRUST_PROXY` | `0` | Set `1` behind Vercel so `req.ip` is correct for rate limiting |
-| `UPLOAD_DIR` | `uploads` | Local image-upload directory (added after this audit, §12) |
-| `API_BASE_URL` | `http://localhost:<PORT>` | Base URL for returned image `imageUrl`s (added after this audit, §12) |
-| `UPLOAD_MAX_BYTES` | `5242880` (5 MB) | Maximum image upload size (added after this audit, §12) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | *(empty)* | **Path** to service-account JSON (Render: a Secret File path, never a Windows path) |
+| `FIREBASE_SERVICE_ACCOUNT` | *(empty)* | **Inline** service-account JSON (alternative to the above; recommended on Render) |
+| `ALLOWED_ORIGINS` | localhost:4200/8100/8101, `capacitor://localhost`, `https://localhost` | CORS allowlist — must be set for production |
+| `TRUST_PROXY` | `0` | Set `1` behind a proxy (Render/Vercel) so `req.ip` is correct for rate limiting |
+| `UPLOAD_DIR` | `uploads` | **Legacy** read-only `GET /uploads/<file>` root only |
+| `API_BASE_URL` | `http://localhost:<PORT>` | **Legacy** local-file `imageUrl` base only; Cloudinary returns absolute HTTPS URLs |
+| `UPLOAD_MAX_BYTES` | `5242880` (5 MB) | Maximum image upload size |
+| `CLOUDINARY_CLOUD_NAME` | *(empty)* | Cloudinary cloud name (server-side only) |
+| `CLOUDINARY_API_KEY` | *(empty)* | Cloudinary API key (server-side only) |
+| `CLOUDINARY_API_SECRET` | *(empty)* | Cloudinary API secret (server-side only) |
 
 There are **no** `PAYMONGO_*`, `*_BUCKET`, or `VERCEL_*` variables anywhere in the code.
 These names are read by `src/config.ts` (the three upload-related names were
@@ -181,16 +207,12 @@ added after this audit — see §12).
 |---|---|---|
 | `npm run typecheck` | `tsc -p tsconfig.json --noEmit` | **PASS** (exit 0) |
 | `npm run lint` | `eslint .` | **PASS** (0 problems) |
-| `npm test` | `vitest run` | **PASS — 3 files, 51/51 tests, exit 0** (see note) |
-| `npm run build` | `tsc -p tsconfig.json` | **PASS** (exit 0) → `dist/` |
+| `npm test` | `vitest run` | **PASS — 13 files, 264/264 tests, exit 0** |
+| `npm run build` | `tsc -p tsconfig.json` | **PASS** (exit 0) → `dist/src/server.js` |
 | `npm run dev` | `tsx watch src/server.ts` | not run (requires optional `.env`) |
-| `npm start` | `node dist/src/server.js` | valid after `npm run build` |
+| `npm start` | `node dist/src/server.js` | **PASS** — verified serving `GET /api/health` (200) |
 
-> Note: the **first** `npm test` invocation reported `2 passed (3)` files / `30 passed (51)` tests plus a
-> `Worker forks emitted error` unhandled error. Two subsequent runs (including `--reporter=verbose`) were
-> clean 51/51. The suite is passing but shows an **intermittent worker-crash flake** on this machine.
-
-Tests need no network or credentials (Firebase is mocked in `src/app.test.ts:5-103`).
+Tests need no network or credentials (Firebase and Cloudinary are mocked in the test files).
 
 ---
 
@@ -220,15 +242,15 @@ Tests need no network or credentials (Firebase is mocked in `src/app.test.ts:5-1
 | Requirement | Status | Evidence / what is missing |
 |---|---|---|
 | Trusted API, server-side order calculations | ✅ **WORKS** | `src/services/orders.service.ts:45-106`; proven by `src/app.test.ts:230-255` |
-| Product CRUD | ⚠️ **PARTIAL** | C/U/D exist; **no read endpoints** (`GET /api/products[/:id]`) — clients read Firestore directly |
+| Product CRUD | ✅ **WORKS** | Create/update/delete (admin) plus public reads `GET /api/products[/:id]` (`src/routes/products.ts`) |
 | Admin authorization | ✅ **WORKS** | `requireAuth` + `requireAdmin` on all 4 admin routes; 401/403 tested (`src/app.test.ts:337-353,470-475`) |
-| Admin order management | ⚠️ **PARTIAL** | Status transition exists; **no order list/detail endpoint** for admins |
-| Localhost image uploads (dev) | ✅ **WORKS** (added after this audit) | `POST /api/admin/uploads` (admin-only, multer, magic-byte type check, 5 MB cap, rate-limited) + `GET /uploads/:file`; storage in `UPLOAD_DIR` (git-ignored). See §12, `README.md`, `docs/API_CONTRACT.md` §6 |
-| Firebase Storage (production) | ❌ **MISSING** | No `getStorage`/`bucket()` usage, no bucket env var |
-| PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'ONLINE'` is stored but inert (`src/services/orders.service.ts:89`) |
+| Admin order management | ⚠️ **PARTIAL** | Status transition, GCash payment decision and manual refunds exist; **no admin order list endpoint** |
+| Image uploads (Cloudinary) | ✅ **WORKS** | `POST /api/admin/uploads` (admin) and `POST /api/profile/photo` (any signed-in user) — multer memory parse, magic-byte type check, 5 MB cap, rate-limited, stored in Cloudinary. See §14, `README.md`, `docs/API_CONTRACT.md` §6 |
+| Firebase Storage | ❌ **NOT USED** | Intentional — permanent image hosting is Cloudinary (§14); no `getStorage`/`bucket()` usage |
+| PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'GCASH'` is manual verification only (`src/services/orders.service.ts:89`) |
 | Secrets server-side | ✅ **WORKS** | No secrets in repo; `.env.example` placeholders empty |
 | Vercel deployment readiness | ⚠️ **PARTIAL** | `api/index.ts` serverless wrapper + dual mounting exist; **no `vercel.json`**, self-declared "PREPARED BUT UNVERIFIED" (`api/index.ts:7-10`), never deployed |
-| Public product browsing before login | ⚠️ **BLOCKED BY RULES** | `firestore.rules:43` requires `isSignedIn()` for `products` read; there is also no public `GET /api/products`. Enabling guest browsing needs a deliberate rules change or a public endpoint |
+| Public product browsing before login | ✅ **WORKS** | Public `GET /api/products[/:id]` via the backend (Admin SDK); the public Firestore read path still depends on `firestore.rules` |
 | Product price = single PHP price | ⚠️ **DO NOT CHANGE** | See §10 — changing the schema is unsafe |
 
 ### 9a. Payment plan (not implemented)
@@ -277,7 +299,13 @@ and changed **no** data.
 
 ---
 
-## 12. Addendum — local image uploads (added after this audit)
+## 12. Addendum — local image uploads (historical, superseded by §14)
+
+> **Superseded.** This section describes the original local-disk upload
+> implementation. New uploads now go to Cloudinary instead of `UPLOAD_DIR`
+> (see §14); the local `uploads/` directory is only served read-only for
+> historical files. The validation, route guards and size limits described
+> below still hold.
 
 Implemented in `bistrobuddies-backend` only; nothing was deployed.
 
@@ -312,3 +340,78 @@ enable the **IAM Credentials API** for project `12668682749`
 (`https://console.developers.google.com/apis/api/iamcredentials.googleapis.com/overview?project=12668682749`)
 so an automated custom-token sign-in can be minted. The IAM API is **not**
 used by this backend — only `createCustomToken` (test tooling) needs it.
+
+---
+
+## 13. Addendum — Contact Us messages (added after this audit)
+
+Implemented in `bistrobuddies-backend` only; nothing was deployed.
+
+| Piece | Where |
+|---|---|
+| Endpoint | `POST /api/contact-messages` (`src/routes/contact-messages.ts`), guards `[rateLimit 10/min/IP, requireAuth]` — any signed-in customer, matching the app's other customer write endpoints; `userId` from the verified token only |
+| Validation | `validateContactMessageRequest` (`src/lib/validation.ts`) — `name` ≤120, `email` ≤254 + format check, `subject` ≤150, `message` ≤2000; all trimmed, empty/whitespace-only rejected with `400 invalid_request` + field details; only these four fields are read |
+| Storage | Firestore `contactMessages` (`src/services/contact-messages.service.ts`) — server-generated doc id, `status: 'NEW'`, `createdAt`/`updatedAt` server timestamps; `201 { id, status }` only after the write resolves, `500` on storage failure |
+| Firestore rules | New `match /contactMessages/{messageId} { allow read, write: if false; }` — purely restrictive (clients get no access; backend Admin SDK bypasses rules). **Not deployed** |
+| Email notifications | **Not configured** — no email provider/dependency exists in the repo; Firestore is the reliable mechanism. Forwarding to `bistrobuddies@gmail.com` is a separate future setup step |
+| Tests | `src/contact-messages.test.ts` — success + trimming, ignored client `userId`/`status`/timestamps, missing fields, invalid email, whitespace-only, over-length, 401 missing/invalid token, Firestore failure → `500` (no false success), `503` without credentials, no GET/PATCH/DELETE access, rate limit; plus unit tests in `src/lib/validation.test.ts` |
+| Docs | `docs/API_CONTRACT.md` §4 "Contact messages", `README.md` |
+
+No new env vars. Status: `npm run typecheck`, `npm run lint`, `npm run build`
+and `npm test` pass (7 files, **149 tests**).
+
+---
+
+## 14. Addendum — current state: Cloudinary storage + Render deployment
+
+> This is the current verified state of the repository on branch
+> `BACKEND-BEFORE-DEPLOYMENT`. It supersedes the local-disk storage described
+> in §12.
+
+### 14.1 Image storage is Cloudinary (not local disk)
+
+- `POST /api/admin/uploads` (admin) and `POST /api/profile/photo` (any
+  signed-in user) parse one `file` field with `multer` (`memoryStorage`) and
+  upload the validated buffer to Cloudinary via the official SDK
+  (`src/lib/cloudinary.ts`, `src/lib/image-upload.ts`), returning the HTTPS
+  `secure_url` as `imageUrl` plus `publicId`.
+- Required server-side env vars: `CLOUDINARY_CLOUD_NAME`,
+  `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`. Missing → `503
+  server_not_configured`; Cloudinary failure → `500 upload_failed`. There is
+  deliberately **no local-disk fallback**.
+- The local `uploads/` directory is only served read-only at
+  `GET /uploads/<file>` for historical files. **44 files under `uploads/` are
+  still tracked in Git** even though `.gitignore` ignores the directory (they
+  were committed before the ignore rule). They are obsolete for new uploads
+  but not deleted by this change; removal from tracking is a deliberate manual
+  step (see README "Legacy tracked uploads").
+
+### 14.2 Render deployment
+
+- `render.yaml` (new) defines a `web` service, `runtime: node`,
+  `buildCommand: npm install && npm run build`,
+  `startCommand: node dist/src/server.js`, `healthCheckPath: /api/health`,
+  `autoDeployTrigger: 'off'`, branch `BACKEND-BEFORE-DEPLOYMENT`.
+- `npm run build` emits `dist/src/server.js` (verified); Render injects `PORT`.
+- `TRUST_PROXY=1` sets Express `trust proxy` to one hop (Render's proxy) in
+  `src/app.ts`; `readBoolean` accepts `1`/`true`.
+- `ALLOWED_ORIGINS` is a comma-separated allowlist parsed in `src/config.ts`;
+  unset → localhost + Capacitor defaults only, so production origins must be
+  set. CORS never reflects arbitrary origins.
+- Secrets are supplied as Render env vars / Secret Files. No secrets, no final
+  public URL and no local Windows paths are stored in the repository.
+
+### 14.3 Rate limiter (unchanged, documented limitation)
+
+`src/middleware/rate-limit.ts` is a fixed-window counter in an in-memory `Map`
+per route group. Correct for a single instance; **not shared** between
+instances, so with N instances the effective limit is `limit × N`, and
+counters reset on deploy/restart. A shared store (e.g. Render Key Value) is not
+added: it would be a new paid dependency and does not affect authentication or
+authorization. See README "Rate limiting".
+
+### 14.4 Verified results (this change)
+
+`npm run typecheck` PASS, `npm run lint` PASS (0 problems), `npm test` PASS
+(13 files, **264 tests**), `npm run build` PASS, and the compiled
+`node dist/src/server.js` served `GET /api/health` with HTTP 200.

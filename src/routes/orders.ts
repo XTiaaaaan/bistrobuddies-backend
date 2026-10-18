@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { notFound } from '../errors';
-import { validateCreateOrderRequest } from '../lib/validation';
+import {
+  validateCreateOrderRequest,
+  validateGcashDetails,
+} from '../lib/validation';
 import {
   getAuth,
   hasAdminRole,
@@ -8,7 +11,12 @@ import {
 } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
-import { createOrder, getOrder } from '../services/orders.service';
+import {
+  cancelOrder,
+  createOrder,
+  getOrder,
+  submitGcashDetails,
+} from '../services/orders.service';
 
 export const ordersRouter = Router();
 
@@ -51,5 +59,54 @@ ordersRouter.get(
       isAdmin: await hasAdminRole(user.uid),
     });
     res.json(order);
+  })
+);
+
+/**
+ * POST /api/orders/:id/cancel — cancel an order (owner only).
+ *
+ * Only the order owner may cancel, and only while the order is still awaiting
+ * confirmation (`PENDING`). The document is never deleted: `orderStatus` is set
+ * to `CANCELLED` and the independent `paymentStatus` is left untouched. The
+ * updated order is returned in the same shape as GET /api/orders/:id.
+ */
+ordersRouter.post(
+  '/orders/:id/cancel',
+  rateLimit({ name: 'orders-cancel', limit: 20, windowMs: 60_000 }),
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const user = getAuth(req);
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw notFound('order_not_found', 'This order no longer exists.');
+    }
+    const order = await cancelOrder(user, orderId);
+    res.json(order);
+  })
+);
+
+/**
+ * POST /api/orders/:id/gcash-details — submit GCash payment details (owner only).
+ *
+ * The caller must own the order, the order must use paymentMethod GCASH, and
+ * its payment must not already be confirmed. Only the GCash account name and
+ * mobile number are read from the body — totals, statuses and credentials are
+ * never accepted. A successful submission moves paymentStatus to VERIFYING;
+ * repeating it (including after an admin REJECTED it) is safe and returns the
+ * order to VERIFYING with the latest details.
+ */
+ordersRouter.post(
+  '/orders/:id/gcash-details',
+  rateLimit({ name: 'orders-gcash', limit: 20, windowMs: 60_000 }),
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const user = getAuth(req);
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw notFound('order_not_found', 'This order no longer exists.');
+    }
+    const input = validateGcashDetails(req.body);
+    const result = await submitGcashDetails(user, orderId, input);
+    res.json(result);
   })
 );

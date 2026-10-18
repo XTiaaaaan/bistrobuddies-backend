@@ -50,7 +50,11 @@ service cloud.firestore {
     // Clients may NOT create orders — order prices/totals must be computed by
     // the trusted backend (POST /api/orders), which uses the Admin SDK and is
     // not affected by this rule. Only admins (or the backend) may change
-    // orderStatus / paymentStatus, so customers cannot alter statuses.
+    // orderStatus / paymentStatus / gcashDetails / paymentDecision /
+    // paymentAudit, so customers cannot mark payments paid, edit submitted
+    // GCash details after the fact, or tamper with the audit trail — all
+    // payment state changes go through the trusted backend endpoints
+    // (POST /api/orders/:id/gcash-details, POST /api/admin/orders/:id/payment).
     match /orders/{orderId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());
@@ -59,13 +63,28 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // payments: private. Only the backend creates payment records (PayMongo
-    // integration, not yet implemented) and only admins may change a status.
+    // payments: private. Reserved for future backend-managed payment records
+    // (manual GCash verification lives on the order document itself; there is
+    // no payment gateway, webhook, or automated processing). Only the backend
+    // creates payment records and only admins may change a status.
     match /payments/{paymentId} {
       allow read: if isSignedIn()
         && (resource.data.customerId == myUid() || isAdmin());
       allow create: if false;
       allow update, delete: if isAdmin();
+    }
+
+    // contactMessages: customer "Contact Us" submissions, including admin
+    // replies stored in each document's `replies` array. Only the trusted
+    // backend writes them (POST /api/contact-messages and
+    // POST /api/admin/contact-messages/:id/replies via the Admin SDK,
+    // which bypasses these rules). Clients may neither read nor write —
+    // customers cannot view their own or other customers' messages, and
+    // nobody can tamper with stored messages and replies. This block is
+    // purely restrictive documentation of that intent (an unmatched
+    // collection is already denied by default).
+    match /contactMessages/{messageId} {
+      allow read, write: if false;
     }
   }
 }

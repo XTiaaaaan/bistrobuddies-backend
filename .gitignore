@@ -33,6 +33,6 @@ coverage/
 .DS_Store
 Thumbs.db
 
-# Runtime uploads (when the local image-upload endpoint is implemented)
+# Runtime uploads (legacy local files served read-only at GET /uploads/<file>;
+# new uploads go to Cloudinary and never touch local disk)
 uploads/
-public/uploads/

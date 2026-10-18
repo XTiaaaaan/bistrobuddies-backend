@@ -51,6 +51,7 @@ function readBoolean(name: string, fallback: boolean): boolean {
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:4200',
   'http://localhost:8100',
+  'http://localhost:8101',
   'capacitor://localhost',
   'https://localhost',
 ];
@@ -69,17 +70,26 @@ export interface BackendConfig {
   allowedOrigins: string[];
   trustProxy: boolean;
   /**
-   * Absolute directory where locally uploaded images are written.
-   * Development storage only — never production storage.
+   * Absolute directory for legacy locally stored images served read-only at
+   * `GET /uploads/<file>`. New uploads go to Cloudinary; this directory is
+   * only kept so historical local files remain readable. Never used as
+   * permanent storage for new uploads.
    */
   uploadsDir: string;
   /**
-   * Base URL (no trailing slash) used to build the absolute `imageUrl`
-   * returned by the upload endpoint, e.g. `http://localhost:3001`.
+   * Base URL (no trailing slash) kept for legacy local files and as a
+   * fallback. New Cloudinary uploads return an absolute HTTPS `secure_url`
+   * and do not use this value.
    */
   apiBaseUrl: string;
   /** Maximum accepted upload size in bytes (default 5 MiB). */
   uploadMaxBytes: number;
+  /** Cloudinary cloud name (public identifier, not a secret). */
+  cloudinaryCloudName: string | null;
+  /** Cloudinary API key (server-side only, never returned to clients). */
+  cloudinaryApiKey: string | null;
+  /** Cloudinary API secret (server-side only, never returned to clients). */
+  cloudinaryApiSecret: string | null;
 }
 
 export function loadConfig(): BackendConfig {
@@ -118,6 +128,11 @@ export function loadConfig(): BackendConfig {
     uploadsDir: path.resolve(readString('UPLOAD_DIR', 'uploads')),
     apiBaseUrl,
     uploadMaxBytes: uploadMaxBytes > 0 ? uploadMaxBytes : DEFAULT_UPLOAD_MAX_BYTES,
+    cloudinaryCloudName:
+      process.env['CLOUDINARY_CLOUD_NAME']?.trim() || null,
+    cloudinaryApiKey: process.env['CLOUDINARY_API_KEY']?.trim() || null,
+    cloudinaryApiSecret:
+      process.env['CLOUDINARY_API_SECRET']?.trim() || null,
   };
 }
 

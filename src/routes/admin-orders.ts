@@ -5,10 +5,13 @@ import { requireFirebase } from '../firebase/admin';
 import {
   allowedNextStatuses,
   validateOrderStatus,
+  validatePaymentDecision,
+  validateRefundAction,
 } from '../lib/validation';
-import { requireAdmin, requireAuth } from '../middleware/auth';
+import { getAuth, requireAdmin, requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
+import { decideGcashPayment, recordRefundAction } from '../services/orders.service';
 
 export const adminOrdersRouter = Router();
 
@@ -69,5 +72,61 @@ adminOrdersRouter.post(
     });
 
     res.json({ id: orderId, orderStatus: nextStatus });
+  })
+);
+
+/**
+ * POST /api/admin/orders/:id/payment — confirm or reject a GCash payment (admin only).
+ *
+ * Body: `{ "decision": "PAID" | "REJECTED" }`. The order must use paymentMethod
+ * GCASH and currently be VERIFYING with submitted customer details. Repeating
+ * the recorded decision is an idempotent no-op; a confirmed (PAID) payment can
+ * never be overwritten, and REJECTED can only become PAID after the customer
+ * resubmits details. Recording a decision never changes `orderStatus`.
+ */
+adminOrdersRouter.post(
+  '/orders/:id/payment',
+  ...adminGuard,
+  asyncHandler(async (req, res) => {
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw new ApiError(400, 'invalid_request', 'A valid order id is required.');
+    }
+
+    const decision = validatePaymentDecision(req.body);
+    const admin = getAuth(req);
+    const result = await decideGcashPayment(admin, orderId, decision);
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/admin/orders/:id/refund — record a manual refund (admin only).
+ *
+ * The admin returns the money out-of-band (e.g. via the GCash app) and records
+ * the actual outcome here:
+ *
+ * - `{ "action": "PENDING" }` opens a pending refund on a CANCELLED order
+ *   whose payment is PAID; it never marks the refund completed.
+ * - `{ "action": "COMPLETE", "confirmed": true }` marks it REFUNDED, only
+ *   after the explicit confirmation that the money was actually sent back.
+ *
+ * The refunded amount is derived from the stored order snapshot, never from
+ * the request body. `orderStatus` and `paymentStatus` are never changed. A
+ * completed refund cannot be repeated. Returns the updated order.
+ */
+adminOrdersRouter.post(
+  '/orders/:id/refund',
+  ...adminGuard,
+  asyncHandler(async (req, res) => {
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw new ApiError(400, 'invalid_request', 'A valid order id is required.');
+    }
+
+    const { action, confirmed } = validateRefundAction(req.body);
+    const admin = getAuth(req);
+    const result = await recordRefundAction(admin, orderId, action, confirmed);
+    res.json(result);
   })
 );

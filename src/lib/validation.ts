@@ -2,7 +2,15 @@ import { FieldIssue, badRequest } from '../errors';
 import { roundMoney } from './money';
 
 export type ProductSize = 'small' | 'medium' | 'large';
-export type PaymentMethod = 'COD' | 'ONLINE';
+/**
+ * Payment methods accepted on order creation.
+ *
+ * - `COD` — cash on delivery (unchanged behaviour).
+ * - `GCASH` — manual GCash verification by an admin (see docs/API_CONTRACT.md).
+ *
+ * Unknown values are rejected — they are never silently treated as COD.
+ */
+export type PaymentMethod = 'COD' | 'GCASH';
 export type OrderStatus =
   | 'PENDING'
   | 'CONFIRMED'
@@ -328,8 +336,8 @@ export function validateCreateOrderRequest(body: unknown): CreateOrderRequest {
   // payment method
   const paymentMethodRaw = source['paymentMethod'];
   let paymentMethod: PaymentMethod = 'COD';
-  if (paymentMethodRaw !== 'COD' && paymentMethodRaw !== 'ONLINE') {
-    issues.add('paymentMethod', 'paymentMethod must be COD or ONLINE.');
+  if (paymentMethodRaw !== 'COD' && paymentMethodRaw !== 'GCASH') {
+    issues.add('paymentMethod', 'paymentMethod must be COD or GCASH.');
   } else {
     paymentMethod = paymentMethodRaw;
   }
@@ -519,6 +527,390 @@ export function validateProductInput(
 
   issues.throwIfAny('The product payload is invalid.');
   return result;
+}
+
+export interface ContactMessageInput {
+  name: string;
+  email: string;
+  subject: string;
+  message: string;
+}
+
+/** Maximum accepted lengths for the Contact Us form fields. */
+export const CONTACT_NAME_MAX = 120;
+export const CONTACT_EMAIL_MAX = 254;
+export const CONTACT_SUBJECT_MAX = 150;
+export const CONTACT_MESSAGE_MAX = 2000;
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Validates the POST /api/contact-messages request body.
+ *
+ * Values are trimmed and rejected when empty/whitespace-only or longer than
+ * the limits above; `email` must additionally look like an email address.
+ * Only these four fields are read — any other client-supplied properties
+ * (e.g. `userId`, `status`, timestamps) are ignored and never trusted.
+ */
+export function validateContactMessageRequest(body: unknown): ContactMessageInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const name = readString(source, 'name', issues, {
+    required: true,
+    max: CONTACT_NAME_MAX,
+  });
+  const email = readString(source, 'email', issues, {
+    required: true,
+    max: CONTACT_EMAIL_MAX,
+  });
+  if (email !== undefined && !EMAIL_PATTERN.test(email)) {
+    issues.add('email', 'email must be a valid email address.');
+  }
+  const subject = readString(source, 'subject', issues, {
+    required: true,
+    max: CONTACT_SUBJECT_MAX,
+  });
+  const message = readString(source, 'message', issues, {
+    required: true,
+    max: CONTACT_MESSAGE_MAX,
+  });
+
+  issues.throwIfAny('The contact message payload is invalid.');
+
+  return {
+    name: name ?? '',
+    email: email ?? '',
+    subject: subject ?? '',
+    message: message ?? '',
+  };
+}
+
+/** Maximum accepted length for an admin reply body. */
+export const CONTACT_REPLY_MAX = 5000;
+
+export interface ContactMessageReplyInput {
+  reply: string;
+}
+
+/**
+ * Validates POST /api/admin/contact-messages/:id/replies bodies.
+ *
+ * Only `reply` is read — any client-supplied `senderRole`, `id` or timestamp
+ * properties are ignored and never trusted; the sender role and timestamps
+ * are decided by the server. The value is trimmed and rejected when
+ * whitespace-only or longer than CONTACT_REPLY_MAX.
+ */
+export function validateContactMessageReply(body: unknown): ContactMessageReplyInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const reply = readString(source, 'reply', issues, {
+    required: true,
+    max: CONTACT_REPLY_MAX,
+  });
+
+  issues.throwIfAny('The reply payload is invalid.');
+
+  return { reply: reply ?? '' };
+}
+
+/** Sender roles stored on a contact-message reply. */
+export type ContactReplySenderRole = 'ADMIN' | 'CUSTOMER';
+
+export type ContactMessageStatus = 'NEW' | 'READ' | 'RESOLVED';
+
+/** Workflow statuses a stored contact message can carry. */
+export const CONTACT_MESSAGE_STATUSES: ContactMessageStatus[] = [
+  'NEW',
+  'READ',
+  'RESOLVED',
+];
+
+/**
+ * Statuses the admin API accepts on an update. `NEW` is the server-assigned
+ * initial status only — an administrator moves messages forward to READ or
+ * RESOLVED, never back to NEW.
+ */
+export const CONTACT_MESSAGE_UPDATABLE_STATUSES: ContactMessageStatus[] = [
+  'READ',
+  'RESOLVED',
+];
+
+export const CONTACT_MESSAGES_DEFAULT_PAGE_SIZE = 25;
+export const CONTACT_MESSAGES_MAX_PAGE_SIZE = 100;
+
+/** Validates PATCH /api/admin/contact-messages/:id/status body. */
+export function validateContactMessageStatusUpdate(
+  body: unknown
+): ContactMessageStatus {
+  const source = asObject(body);
+  const raw = source['status'];
+  if (
+    typeof raw !== 'string' ||
+    !CONTACT_MESSAGE_UPDATABLE_STATUSES.includes(raw as ContactMessageStatus)
+  ) {
+    throw badRequest(
+      `status must be one of: ${CONTACT_MESSAGE_UPDATABLE_STATUSES.join(', ')}.`
+    );
+  }
+  return raw as ContactMessageStatus;
+}
+
+export interface ContactMessageListQuery {
+  page: number;
+  pageSize: number;
+  status?: ContactMessageStatus;
+}
+
+/** Parses a query-string value into a positive integer, or null when invalid. */
+function readPositiveInteger(raw: unknown): number | null {
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    return null;
+  }
+  const value = typeof raw === 'string' ? Number(raw) : raw;
+  if (!Number.isInteger(value) || value < 1) {
+    return null;
+  }
+  return value;
+}
+
+/**
+ * Validates GET /api/admin/contact-messages query parameters.
+ *
+ * `status` (optional) must be a known workflow status; `page` and `pageSize`
+ * (optional) must be positive integers with `pageSize` capped at
+ * CONTACT_MESSAGES_MAX_PAGE_SIZE so a single request can never ask Firestore
+ * for an unbounded page.
+ */
+export function readContactMessageListQuery(
+  query: Record<string, unknown>
+): ContactMessageListQuery {
+  const issues = new Issues();
+  let page = 1;
+  let pageSize = CONTACT_MESSAGES_DEFAULT_PAGE_SIZE;
+  let status: ContactMessageStatus | undefined;
+
+  const statusRaw = query['status'];
+  if (statusRaw !== undefined && statusRaw !== null && statusRaw !== '') {
+    if (
+      typeof statusRaw !== 'string' ||
+      !CONTACT_MESSAGE_STATUSES.includes(statusRaw as ContactMessageStatus)
+    ) {
+      issues.add(
+        'status',
+        `status must be one of: ${CONTACT_MESSAGE_STATUSES.join(', ')}.`
+      );
+    } else {
+      status = statusRaw as ContactMessageStatus;
+    }
+  }
+
+  const pageRaw = query['page'];
+  if (pageRaw !== undefined && pageRaw !== null && pageRaw !== '') {
+    const parsed = readPositiveInteger(pageRaw);
+    if (parsed === null) {
+      issues.add('page', 'page must be a positive integer.');
+    } else {
+      page = parsed;
+    }
+  }
+
+  const pageSizeRaw = query['pageSize'];
+  if (pageSizeRaw !== undefined && pageSizeRaw !== null && pageSizeRaw !== '') {
+    const parsed = readPositiveInteger(pageSizeRaw);
+    if (parsed === null || parsed > CONTACT_MESSAGES_MAX_PAGE_SIZE) {
+      issues.add(
+        'pageSize',
+        `pageSize must be an integer between 1 and ${CONTACT_MESSAGES_MAX_PAGE_SIZE}.`
+      );
+    } else {
+      pageSize = parsed;
+    }
+  }
+
+  issues.throwIfAny('The contact message query is invalid.');
+
+  return {
+    page,
+    pageSize,
+    ...(status !== undefined ? { status } : {}),
+  };
+}
+
+/** Validates and normalizes a `:id` path parameter for contact message routes. */
+export function readContactMessageId(raw: string): string {
+  let decoded = raw ?? '';
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Malformed percent-encoding: treat the raw value as the id.
+  }
+  const messageId = decoded.trim();
+  if (!messageId || messageId.length > 128) {
+    throw badRequest('A valid message id is required.', [
+      { field: 'id', message: 'id must be 1-128 characters.' },
+    ]);
+  }
+  return messageId;
+}
+
+/**
+ * Payment lifecycle for manual GCash verification (stored on the order doc).
+ *
+ * - `PENDING` — initial status for every new order (COD and GCash alike).
+ * - `VERIFYING` — the customer submitted GCash details; awaiting admin review.
+ * - `PAID` — an admin confirmed the payment (terminal).
+ * - `REJECTED` — an admin rejected the payment; the customer may resubmit,
+ *   which moves the order back to `VERIFYING`.
+ *
+ * COD orders never leave `PENDING`. Confirming payment never changes the
+ * separate fulfilment field `orderStatus`.
+ */
+export type PaymentStatus = 'PENDING' | 'VERIFYING' | 'PAID' | 'REJECTED';
+
+/** Decisions an admin may record on a GCash payment. */
+export type PaymentDecision = 'PAID' | 'REJECTED';
+
+export const PAYMENT_DECISIONS: PaymentDecision[] = ['PAID', 'REJECTED'];
+
+/** Maximum accepted lengths for the GCash payment-detail fields. */
+export const GCASH_ACCOUNT_NAME_MIN = 2;
+export const GCASH_ACCOUNT_NAME_MAX = 80;
+
+export interface GcashDetailsInput {
+  /** Trimmed account name (whitespace collapsed). Never proves payment. */
+  accountName: string;
+  /** Philippine mobile number normalized to local `09XXXXXXXXX` form. */
+  accountNumber: string;
+}
+
+/**
+ * Normalizes a Philippine mobile number to local `09XXXXXXXXX` form.
+ *
+ * Accepted inputs (ignoring spaces, hyphens, dots and parentheses):
+ * `09XXXXXXXXX`, `639XXXXXXXXX` and `+639XXXXXXXXX`. Anything else —
+ * landlines, short codes, non-PH numbers, letters — returns null.
+ */
+export function normalizeGcashNumber(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const compact = raw.trim().replace(/[\s\-().]/g, '');
+  if (!/^(?:\+?63|0)9\d{9}$/.test(compact)) {
+    return null;
+  }
+  if (compact.startsWith('+63')) {
+    return `0${compact.slice(3)}`;
+  }
+  if (compact.startsWith('63')) {
+    return `0${compact.slice(2)}`;
+  }
+  return compact;
+}
+
+/**
+ * Validates POST /api/orders/:id/gcash-details bodies.
+ *
+ * Only `accountName` and `accountNumber` are read — any other properties
+ * (totals, statuses, `pin`/`otp`/`password` or other credentials) are ignored
+ * and never trusted. GCash credentials must never be sent; this endpoint has
+ * no fields for them.
+ */
+export function validateGcashDetails(body: unknown): GcashDetailsInput {
+  const source = asObject(body);
+  const issues = new Issues();
+
+  const accountName = readString(source, 'accountName', issues, {
+    required: true,
+    min: GCASH_ACCOUNT_NAME_MIN,
+    max: GCASH_ACCOUNT_NAME_MAX,
+  });
+
+  const numberRaw = source['accountNumber'];
+  let accountNumber: string | null = null;
+  if (typeof numberRaw !== 'string' || numberRaw.trim() === '') {
+    issues.add('accountNumber', 'accountNumber is required.');
+  } else {
+    const normalized = normalizeGcashNumber(numberRaw);
+    if (normalized === null) {
+      issues.add(
+        'accountNumber',
+        'accountNumber must be a valid Philippine mobile number (e.g. 09171234567).'
+      );
+    } else {
+      accountNumber = normalized;
+    }
+  }
+
+  issues.throwIfAny('The GCash payment details are invalid.');
+
+  // Collapse internal whitespace so equivalent names compare equal.
+  const collapsed = (accountName ?? '').replace(/\s+/g, ' ').trim();
+  return { accountName: collapsed, accountNumber: accountNumber ?? '' };
+}
+
+/** Validates POST /api/admin/orders/:id/payment bodies. */
+export function validatePaymentDecision(body: unknown): PaymentDecision {
+  const source = asObject(body);
+  const raw = source['decision'];
+  if (typeof raw !== 'string' || !PAYMENT_DECISIONS.includes(raw as PaymentDecision)) {
+    throw badRequest('decision must be one of: PAID, REJECTED.');
+  }
+  return raw as PaymentDecision;
+}
+
+/**
+ * Refund lifecycle for cancelled orders whose payment was confirmed as PAID.
+ * Stored on the order document as `refund.status` — independent of the
+ * `paymentStatus` field (which stays `PAID`; a refund is returned money, not
+ * a payment-state change):
+ *
+ * - `NOT_REFUNDED` — default for every order; no refund recorded yet.
+ * - `REFUND_PENDING` — an admin opened a refund; the money has not been sent.
+ * - `REFUNDED` — an admin explicitly confirmed the money was actually sent.
+ */
+export type RefundStatus = 'NOT_REFUNDED' | 'REFUND_PENDING' | 'REFUNDED';
+
+export const REFUND_STATUSES: RefundStatus[] = [
+  'NOT_REFUNDED',
+  'REFUND_PENDING',
+  'REFUNDED',
+];
+
+/** Admin actions accepted on the refund endpoint. */
+export type RefundAction = 'PENDING' | 'COMPLETE';
+
+export const REFUND_ACTIONS: RefundAction[] = ['PENDING', 'COMPLETE'];
+
+export interface RefundActionInput {
+  action: RefundAction;
+  /**
+   * Explicit admin confirmation that the money was actually sent back. Only
+   * required (and only meaningful) for `COMPLETE` — starting a refund never
+   * needs it and never marks the refund completed.
+   */
+  confirmed: boolean;
+}
+
+/** Validates POST /api/admin/orders/:id/refund bodies. */
+export function validateRefundAction(body: unknown): RefundActionInput {
+  const source = asObject(body);
+  const raw = source['action'];
+  if (
+    typeof raw !== 'string' ||
+    !REFUND_ACTIONS.includes(raw as RefundAction)
+  ) {
+    throw badRequest('action must be one of: PENDING, COMPLETE.');
+  }
+  const action = raw as RefundAction;
+  const confirmed = source['confirmed'] === true;
+  if (action === 'COMPLETE' && !confirmed) {
+    throw badRequest(
+      'Recording a completed refund requires explicit confirmation: set "confirmed" to true.'
+    );
+  }
+  return { action, confirmed };
 }
 
 /** Validates POST /api/admin/orders/:id/status body. */

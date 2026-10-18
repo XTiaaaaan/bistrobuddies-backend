@@ -8,9 +8,11 @@ import {
   notFoundHandler,
 } from './middleware/error-handler';
 import { logger } from './logger';
+import { adminContactMessagesRouter } from './routes/admin-contact-messages';
 import { adminOrdersRouter } from './routes/admin-orders';
 import { adminProductsRouter } from './routes/admin-products';
 import { adminUploadsRouter } from './routes/admin-uploads';
+import { contactMessagesRouter } from './routes/contact-messages';
 import { healthRouter } from './routes/health';
 import { ordersRouter } from './routes/orders';
 import { productsRouter } from './routes/products';
@@ -55,25 +57,26 @@ export function createApp(): Express {
   api.use(healthRouter);
   api.use(productsRouter);
   api.use(ordersRouter);
+  api.use(contactMessagesRouter);
   api.use('/admin/products', adminProductsRouter);
   api.use('/admin/uploads', adminUploadsRouter);
+  api.use('/admin/contact-messages', adminContactMessagesRouter);
   api.use('/admin', adminOrdersRouter);
   api.use('/profile', profileUploadsRouter);
 
   app.use('/api', api);
   app.use('/', api);
 
-  // Local development image storage (see docs/API_CONTRACT.md § "Image
-  // uploads"). Files live in UPLOAD_DIR and are served read-only at
-  // `GET /uploads/<file>`. This is development-only storage: the local disk
-  // is not persistent or production-grade — production must use Firebase
-  // Storage instead. The CORP header is relaxed for this path so the admin
-  // and mobile frontends can embed the images cross-origin; helmet's
-  // `same-origin` default would otherwise block them in <img> tags.
+  // Legacy local files (see docs/API_CONTRACT.md § "Image uploads"). New
+  // uploads go to Cloudinary; files already in UPLOAD_DIR are still served
+  // read-only at `GET /uploads/<file>` so historical URLs keep working. The
+  // CORP header is relaxed for this path so the admin and mobile frontends
+  // can embed the images cross-origin; helmet's `same-origin` default would
+  // otherwise block them in <img> tags.
   try {
     ensureUploadsDir();
   } catch (error) {
-    logger.warn('Uploads directory could not be created; image uploads will fail.', {
+    logger.warn('Uploads directory could not be created; legacy local images will be unavailable.', {
       uploadsDir: config.uploadsDir,
       reason: error instanceof Error ? error.message : 'unknown',
     });
