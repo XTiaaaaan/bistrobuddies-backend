@@ -854,6 +854,61 @@ describe('bistrobuddies-backend HTTP API', () => {
       );
     });
 
+    it('allows the Android Capacitor origin', async () => {
+      const response = await fetch(`${base}/api/products`, {
+        headers: { Origin: 'https://localhost' },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('access-control-allow-origin')).toBe(
+        'https://localhost'
+      );
+    });
+
+    it('allows the iOS Capacitor origin', async () => {
+      const response = await fetch(`${base}/api/products`, {
+        headers: { Origin: 'capacitor://localhost' },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('access-control-allow-origin')).toBe(
+        'capacitor://localhost'
+      );
+    });
+
+    it('answers preflight requests for the Android origin', async () => {
+      const response = await fetch(`${base}/api/orders`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://localhost',
+          'Access-Control-Request-Method': 'POST',
+          'Access-Control-Request-Headers': 'authorization,content-type',
+        },
+      });
+      expect(response.status).toBe(204);
+      expect(response.headers.get('access-control-allow-origin')).toBe(
+        'https://localhost'
+      );
+      expect(response.headers.get('access-control-allow-methods')).toContain(
+        'POST'
+      );
+      const allowedHeaders = (
+        response.headers.get('access-control-allow-headers') ?? ''
+      ).toLowerCase();
+      expect(allowedHeaders).toContain('authorization');
+      expect(allowedHeaders).toContain('content-type');
+    });
+
+    it('does not allow preflight requests from unknown origins', async () => {
+      const response = await fetch(`${base}/api/orders`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://evil.example',
+          'Access-Control-Request-Method': 'POST',
+          'Access-Control-Request-Headers': 'authorization,content-type',
+        },
+      });
+      expect(response.headers.get('access-control-allow-origin')).toBeNull();
+    });
+
     it('does not allow unknown origins', async () => {
       const response = await fetch(`${base}/api/health`, {
         headers: { Origin: 'https://evil.example' },
