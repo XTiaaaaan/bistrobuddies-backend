@@ -48,13 +48,37 @@ function readBoolean(name: string, fallback: boolean): boolean {
   return value.trim() === '1' || value.trim().toLowerCase() === 'true';
 }
 
+/**
+ * Origins used by Capacitor native shells (Android uses `https://localhost`,
+ * iOS uses `capacitor://localhost`). These are always allowed so setting
+ * `ALLOWED_ORIGINS` for production web origins can never lock out the mobile
+ * apps. They are exact origins, not wildcards.
+ */
+const NATIVE_APP_ORIGINS = ['https://localhost', 'capacitor://localhost'];
+
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:4200',
   'http://localhost:8100',
   'http://localhost:8101',
-  'capacitor://localhost',
-  'https://localhost',
+  ...NATIVE_APP_ORIGINS,
 ];
+
+/**
+ * Resolves the CORS allowlist from a raw comma-separated env value.
+ * Configured web origins are preserved verbatim (trimmed, deduplicated) and
+ * the Capacitor native-app origins are always included.
+ */
+export function resolveAllowedOrigins(raw: string | undefined): string[] {
+  const configured =
+    raw !== undefined && raw.trim() !== ''
+      ? raw
+          .split(',')
+          .map((origin) => origin.trim())
+          .filter((origin) => origin !== '' && origin !== '*')
+      : DEFAULT_ALLOWED_ORIGINS;
+
+  return [...new Set([...configured, ...NATIVE_APP_ORIGINS])];
+}
 
 /** Default upload ceiling: 5 MiB per image (see docs/API_CONTRACT.md). */
 const DEFAULT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
@@ -94,12 +118,9 @@ export interface BackendConfig {
 
 export function loadConfig(): BackendConfig {
   const port = readNumber('PORT', 3001);
-  const allowedOrigins = readString('ALLOWED_ORIGINS', '')
-    ? readString('ALLOWED_ORIGINS', '')
-        .split(',')
-        .map((origin) => origin.trim())
-        .filter((origin) => origin !== '')
-    : DEFAULT_ALLOWED_ORIGINS;
+  const allowedOrigins = resolveAllowedOrigins(
+    process.env['ALLOWED_ORIGINS']
+  );
   // Trailing slashes are stripped so `/uploads/<file>` can be appended safely.
   const apiBaseUrl = readString(
     'API_BASE_URL',
