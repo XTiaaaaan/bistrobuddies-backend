@@ -12,6 +12,7 @@ import { getAuth, requireAdmin, requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
 import {
+  completedCodPaymentPatch,
   confirmCodPayment,
   decideOrderPayment,
   recordRefundAction,
@@ -31,7 +32,9 @@ const adminGuard = [
  * Transitions are validated against the allowed status graph; re-sending the
  * current status is treated as an idempotent no-op. The order status is never
  * taken from anywhere but this validated request body, and only after the
- * caller has been verified as an administrator server-side.
+ * caller has been verified as an administrator server-side. Moving a COD order
+ * to `COMPLETED` marks its payment `PAID` in the same write (cash is collected
+ * on delivery); GCash payment status is never changed here.
  */
 adminOrdersRouter.post(
   '/orders/:id/status',
@@ -51,7 +54,8 @@ adminOrdersRouter.post(
       throw notFound('order_not_found', 'This order no longer exists.');
     }
 
-    const currentStatus = snapshot.data()?.['orderStatus'];
+    const data = snapshot.data() ?? {};
+    const currentStatus = data['orderStatus'];
     if (currentStatus === nextStatus) {
       // Idempotent: repeating the current status is a successful no-op.
       res.json({ id: orderId, orderStatus: currentStatus });
@@ -70,12 +74,27 @@ adminOrdersRouter.post(
       );
     }
 
-    await orderRef.update({
+    const patch: Record<string, unknown> = {
       orderStatus: nextStatus,
       updatedAt: FieldValue.serverTimestamp(),
-    });
+    };
+    // Cash is collected on delivery, so completing a COD order settles the
+    // payment in the same write. GCash payments stay independent.
+    const codSettlement =
+      nextStatus === 'COMPLETED'
+        ? completedCodPaymentPatch(data, getAuth(req).uid)
+        : null;
+    if (codSettlement) {
+      Object.assign(patch, codSettlement);
+    }
 
-    res.json({ id: orderId, orderStatus: nextStatus });
+    await orderRef.update(patch);
+
+    res.json({
+      id: orderId,
+      orderStatus: nextStatus,
+      ...(codSettlement ? { paymentStatus: 'PAID' } : {}),
+    });
   })
 );
 

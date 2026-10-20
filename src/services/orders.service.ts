@@ -424,6 +424,45 @@ function readPaymentDecision(
   };
 }
 
+/**
+ * Payment fields to write when a COD order is completed.
+ *
+ * Cash is collected on delivery, so reaching `COMPLETED` settles an unpaid COD
+ * payment in the same write as the fulfilment update. Returns `null` for
+ * non-COD orders and for COD orders that are already `PAID`, so the status
+ * transition stays a no-op for them.
+ */
+export function completedCodPaymentPatch(
+  data: Record<string, unknown>,
+  adminUid: string
+): Record<string, unknown> | null {
+  if (data['paymentMethod'] !== 'COD') {
+    return null;
+  }
+  const current = readStoredPaymentStatus(data);
+  if (current !== 'PENDING') {
+    return null;
+  }
+
+  const audit = readPaymentAudit(data);
+  audit.push({
+    from: current,
+    to: 'PAID',
+    actorUid: adminUid,
+    actorRole: 'admin',
+  });
+
+  return {
+    paymentStatus: 'PAID',
+    paymentDecision: {
+      decision: 'PAID',
+      decidedBy: adminUid,
+      decidedAt: FieldValue.serverTimestamp(),
+    },
+    paymentAudit: audit,
+  };
+}
+
 function readPaymentAudit(data: Record<string, unknown>): PaymentAuditEntry[] {
   const raw = data['paymentAudit'];
   if (!Array.isArray(raw)) {
@@ -960,7 +999,9 @@ type PaymentDecisionScope = 'GCASH' | 'COD' | 'ANY';
  * only become `PAID` after the customer resubmits.
  *
  * COD rules: only an explicit `PAID` decision (cash actually collected) is
- * accepted. Completing an order never changes its payment status on its own.
+ * accepted, and only once the order is `COMPLETED` (cash is collected on
+ * delivery). Completing a COD order settles it to `PAID` automatically; this
+ * endpoint remains for legacy completed orders still stored as `PENDING`.
  * The fulfilment field `orderStatus` is never touched here.
  */
 async function decidePayment(
@@ -1000,6 +1041,13 @@ async function decidePayment(
       const current = readStoredPaymentStatus(data);
       if (current === 'PAID') {
         return { id: orderId, paymentStatus: current };
+      }
+      if (data['orderStatus'] !== 'COMPLETED') {
+        throw new ApiError(
+          409,
+          'invalid_payment_transition',
+          'Cash-on-delivery payment can only be collected after the order is completed.'
+        );
       }
       if (current !== 'PENDING') {
         throw new ApiError(
@@ -1122,10 +1170,10 @@ export function decideOrderPayment(
 /**
  * Explicitly confirms that cash was collected for a COD order.
  *
- * This is the authorized COD action that keeps payment status independent of
- * fulfilment: moving an order to `COMPLETED` never marks it PAID, but an
- * administrator can record the actual collection here. Repeating it is an
- * idempotent no-op and a confirmed payment can never be overwritten.
+ * Completing a COD order marks it PAID automatically because cash is collected
+ * on delivery; this action exists for legacy completed orders that are still
+ * `PENDING`. It requires `orderStatus === 'COMPLETED'`, is an idempotent no-op
+ * once paid, and a confirmed payment can never be overwritten.
  */
 export function confirmCodPayment(
   admin: { uid: string },

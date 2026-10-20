@@ -239,6 +239,7 @@ describe('manual GCash verification', () => {
         gcashOrder({
           id: 'c-cod',
           paymentMethod: 'COD',
+          orderStatus: 'COMPLETED',
           paymentStatus: 'PENDING',
         }),
       ],
