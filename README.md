@@ -59,6 +59,8 @@ Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 | POST | `/api/orders/:id/cancel` | Bearer (owner) | Cancels a `PENDING` order (`orderStatus: CANCELLED`, never deletes). 20 req/min/IP |
 | POST | `/api/orders/:id/gcash-details` | Bearer (owner) | Submits GCash name/number for manual verification → `{ id, paymentStatus }`. 20 req/min/IP |
 | POST | `/api/orders/:id/payment-proof` | Bearer (owner) | Uploads mandatory GCash proof (multipart `file`, JPEG/PNG/WebP, ≤5 MB) to Cloudinary → `{ id, paymentStatus: "VERIFYING", paymentProof }`. Alias: `/gcash-proof`. 20 req/min/IP |
+| POST | `/api/notifications/devices` | Bearer (any user) | Registers/refreshes an FCM device token → `201 { id, platform }`. 60 req/min/IP |
+| DELETE | `/api/notifications/devices` | Bearer (token owner) | Removes the caller's token → `{ removed }`. Alias: `POST /api/notifications/devices/remove`. 60 req/min/IP |
 | POST | `/api/contact-messages` | Bearer (customer) | Stores a "Contact Us" submission in Firestore → `{ id, status }`. 10 req/min/IP |
 | GET | `/api/contact-messages/mine` | Bearer (customer) | The caller's own messages, newest first. 60 req/min/IP |
 | POST | `/api/admin/products` | Bearer (admin) | Creates a product. 60 req/min/IP |
@@ -67,10 +69,10 @@ Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 | POST | `/api/admin/uploads` | Bearer (admin) | Stores a product image in Cloudinary → `{ imageUrl, publicId, … }`. 30 req/min/IP (see below) |
 | POST | `/api/profile/photo` | Bearer (customer) | Stores the caller's profile picture in Cloudinary. 30 req/min/IP |
 | GET | `/uploads/:file` | — (public read) | Serves **legacy** local images read-only (new uploads go to Cloudinary) |
-| POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status); `COMPLETED` settles COD to `PAID` |
-| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm legacy COD collection (completed orders only) → `{ id, paymentStatus }` |
+| POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status); never changes `paymentStatus`. Delivery flow: `READY → OUT_FOR_DELIVERY → COMPLETED` |
+| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or record COD collection (completed orders only) → `{ id, paymentStatus }` |
 | POST | `/api/admin/orders/:id/payment-proof` | Bearer (admin) | Alias of `/payment` for reviewing submitted proof |
-| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Confirm legacy COD cash collection on a completed order → `{ id, paymentStatus: "PAID" }` |
+| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Explicitly record COD cash collection on a completed order → `{ id, paymentStatus: "PAID" }` |
 | POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` |
 | GET | `/api/admin/contact-messages` | Bearer (admin) | Lists customer "Contact Us" messages, newest first (`?status=NEW\|READ\|RESOLVED`, `?page`, `?pageSize`). 60 req/min/IP |
 | PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | Sets `status` to `READ` or `RESOLVED` → `{ id, status }` |
@@ -83,15 +85,17 @@ response shapes: **`docs/API_CONTRACT.md`**.
 
 ### Payment status and GCash proof
 
-`orderStatus` (fulfilment) and `paymentStatus` (money) are independent. Moving
-a COD order to `COMPLETED` marks it `PAID` in the same write, because cash is
-collected on delivery. GCash becomes `PAID` only when an administrator confirms
-it after reviewing the customer's submitted details **and proof**.
+`orderStatus` (fulfilment) and `paymentStatus` (money) are fully independent.
+Dispatching (`OUT_FOR_DELIVERY`) or completing an order never marks it paid.
+GCash becomes `PAID` only when an administrator confirms it after reviewing the
+customer's submitted details **and proof**. COD cash collection is recorded
+explicitly with `POST /api/admin/orders/:id/cod-payment` (or `/payment` with
+`{ "decision": "PAID" }`); it requires the order to be `COMPLETED` and never
+changes `orderStatus`.
 
-The explicit admin actions `POST /api/admin/orders/:id/cod-payment` (or
-`/payment` with `{ "decision": "PAID" }`) remain available for legacy completed
-COD orders that are still `PENDING`; they require the order to be `COMPLETED`
-and never change `orderStatus`.
+Delivery orders progress `READY → OUT_FOR_DELIVERY → COMPLETED`; pickup orders
+go directly `READY → COMPLETED`. `OUT_FOR_DELIVERY` is the stored value and the
+API also returns `orderStatusLabel: "On the Way"` for display.
 
 The mandatory GCash proof is uploaded by the order owner via
 `POST /api/orders/:id/payment-proof` (alias `/gcash-proof`) as
@@ -103,6 +107,33 @@ rejection. Proof cannot be changed once the payment is `PAID`, and a successful
 upload whose Firestore write fails has its Cloudinary asset cleaned up
 best-effort. Administrators see the proof URL in the normal order data and
 approve/reject it through the admin payment endpoint (admin role required).
+
+### Push notifications (FCM)
+
+Push notifications are sent through Firebase Cloud Messaging with the same
+Firebase Admin credentials already used for Firestore; no extra server key or
+Cloud Functions deployment is needed. Clients register their FCM registration
+token with `POST /api/notifications/devices` and remove it with
+`DELETE /api/notifications/devices` (or `POST /api/notifications/devices/remove`).
+The owning `uid` always comes from the verified ID token, and a user may have
+multiple devices.
+
+Events sent:
+
+- the order's customer on `CONFIRMED`, `PREPARING`, `READY`,
+  `OUT_FOR_DELIVERY` ("On the Way") and `COMPLETED` status changes;
+- every admin device when a new order is created;
+- every admin device when GCash payment proof is submitted;
+- the customer when an admin records a GCash `PAID`/`REJECTED` decision.
+
+Notifications are best-effort: failures are logged and never roll back or fail
+the order/payment operation. Event ids are claimed transactionally in the
+server-only `notifications` collection, so repeated requests do not send
+duplicate pushes. Invalid/expired FCM tokens are removed automatically.
+Set `NOTIFICATIONS_ENABLED=false` to disable sending entirely. Both
+`deviceTokens` and `notifications` deny all direct client access in
+`firestore.rules`. Payloads contain only the order id/status (no GCash account
+numbers or proof URLs).
 
 ### Product schema and currency
 
@@ -245,7 +276,8 @@ uploads return Cloudinary HTTPS URLs and are unaffected.
   client access: public reads on `products` only; `users`/`orders`/`payments`
   are private; clients cannot create orders/payments or change any status —
   those writes happen only through this API (Admin SDK); `contactMessages`
-  is fully denied to clients (backend-only, no customer read access).
+  is fully denied to clients (backend-only, no customer read access);
+  `deviceTokens` and `notifications` are also fully denied to clients.
   Rules are **not** deployed from this repo; deploy them deliberately with
   the Firebase CLI.
 
@@ -309,6 +341,7 @@ the hosting provider's environment.
 | `UPLOAD_MAX_BYTES` | no | Default `5242880` (5 MB) |
 | `UPLOAD_DIR` | no | Legacy read-only `GET /uploads/<file>` root. Default `uploads` |
 | `API_BASE_URL` | no | Legacy local-file URL base only; Cloudinary returns absolute HTTPS URLs |
+| `NOTIFICATIONS_ENABLED` | no | `true` (default) sends FCM push notifications; set `false` to disable sending |
 
 ### Configuring Firebase securely in Render
 

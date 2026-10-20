@@ -9,10 +9,16 @@ import { CURRENCY, resolvePrice, roundMoney } from '../lib/money';
 import { toIso } from '../lib/serialize';
 import { logger } from '../logger';
 import {
+  notifyAdminsNewOrder,
+  notifyAdminsPaymentProofSubmitted,
+  notifyPaymentDecision,
+} from './notifications.service';
+import {
   CreateOrderRequest,
   CreateOrderItemInput,
   GcashDetailsInput,
   MAX_QUANTITY,
+  orderStatusLabel,
   PaymentDecision,
   PaymentStatus,
   ProductSize,
@@ -27,6 +33,8 @@ export interface OrderSummary {
   total: number;
   currency: string;
   orderStatus: string;
+  /** User-facing label (e.g. `OUT_FOR_DELIVERY` -> "On the Way"). */
+  orderStatusLabel: string;
   paymentStatus: string;
 }
 
@@ -131,6 +139,9 @@ export async function createOrder(
 
   await orderRef.set(order);
 
+  // Best-effort admin push; notification failures never fail order creation.
+  await notifyAdminsNewOrder(orderRef.id);
+
   return {
     id: orderRef.id,
     subtotal,
@@ -138,6 +149,7 @@ export async function createOrder(
     total,
     currency: CURRENCY,
     orderStatus: 'PENDING',
+    orderStatusLabel: orderStatusLabel('PENDING'),
     paymentStatus: 'PENDING',
   };
 }
@@ -318,6 +330,8 @@ export interface OrderResponse {
   /** Refund audit trail. Present for administrators only. */
   refundAudit?: RefundAuditEntry[];
   orderStatus: string;
+  /** User-facing label (e.g. `OUT_FOR_DELIVERY` -> "On the Way"). */
+  orderStatusLabel: string;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -421,45 +435,6 @@ function readPaymentDecision(
     decision,
     decidedBy: typeof record['decidedBy'] === 'string' ? record['decidedBy'] : '',
     decidedAt: toIso(record['decidedAt']),
-  };
-}
-
-/**
- * Payment fields to write when a COD order is completed.
- *
- * Cash is collected on delivery, so reaching `COMPLETED` settles an unpaid COD
- * payment in the same write as the fulfilment update. Returns `null` for
- * non-COD orders and for COD orders that are already `PAID`, so the status
- * transition stays a no-op for them.
- */
-export function completedCodPaymentPatch(
-  data: Record<string, unknown>,
-  adminUid: string
-): Record<string, unknown> | null {
-  if (data['paymentMethod'] !== 'COD') {
-    return null;
-  }
-  const current = readStoredPaymentStatus(data);
-  if (current !== 'PENDING') {
-    return null;
-  }
-
-  const audit = readPaymentAudit(data);
-  audit.push({
-    from: current,
-    to: 'PAID',
-    actorUid: adminUid,
-    actorRole: 'admin',
-  });
-
-  return {
-    paymentStatus: 'PAID',
-    paymentDecision: {
-      decision: 'PAID',
-      decidedBy: adminUid,
-      decidedAt: FieldValue.serverTimestamp(),
-    },
-    paymentAudit: audit,
   };
 }
 
@@ -595,6 +570,10 @@ export function serializeOrder(
   options?: { isAdmin?: boolean }
 ): OrderResponse {
   const paymentProof = readPaymentProof(data);
+  const storedOrderStatus =
+    typeof data['orderStatus'] === 'string'
+      ? data['orderStatus']
+      : 'PENDING';
   const response: OrderResponse = {
     id: orderId,
     customerId:
@@ -626,10 +605,8 @@ export function serializeOrder(
     proofUrl: paymentProof?.url ?? null,
     gcashProofUrl: paymentProof?.url ?? null,
     refund: readRefund(data),
-    orderStatus:
-      typeof data['orderStatus'] === 'string'
-        ? data['orderStatus']
-        : 'PENDING',
+    orderStatus: storedOrderStatus,
+    orderStatusLabel: orderStatusLabel(storedOrderStatus),
     createdAt: toIso(data['createdAt']),
     updatedAt: toIso(data['updatedAt']),
   };
@@ -909,7 +886,7 @@ export async function submitGcashProof(
   const now = new Date();
 
   try {
-    return await db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
       const snapshot = await tx.get(orderRef);
       if (!snapshot.exists) {
         throw notFound('order_not_found', 'This order no longer exists.');
@@ -967,6 +944,9 @@ export async function submitGcashProof(
         },
       };
     });
+
+    await notifyAdminsPaymentProofSubmitted(orderId, saved.publicId);
+    return result;
   } catch (error) {
     const cleaned = await deleteFromCloudinary(saved.publicId);
     logger.warn('Orphaned GCash payment proof upload cleanup attempted.', {
@@ -1000,9 +980,9 @@ type PaymentDecisionScope = 'GCASH' | 'COD' | 'ANY';
  *
  * COD rules: only an explicit `PAID` decision (cash actually collected) is
  * accepted, and only once the order is `COMPLETED` (cash is collected on
- * delivery). Completing a COD order settles it to `PAID` automatically; this
- * endpoint remains for legacy completed orders still stored as `PENDING`.
- * The fulfilment field `orderStatus` is never touched here.
+ * delivery). Completing an order never settles payment automatically; the
+ * admin records collection separately. The fulfilment field `orderStatus` is
+ * never touched here.
  */
 async function decidePayment(
   admin: { uid: string },
@@ -1012,8 +992,15 @@ async function decidePayment(
 ): Promise<PaymentDecisionResult> {
   const { db } = requireFirebase();
   const orderRef = db.doc(`orders/${orderId}`);
+  const paymentNotification: {
+    value: {
+      customerId: string;
+      decision: PaymentDecision;
+      revision: number;
+    } | null;
+  } = { value: null };
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snapshot = await tx.get(orderRef);
     if (!snapshot.exists) {
       throw notFound('order_not_found', 'This order no longer exists.');
@@ -1141,8 +1128,27 @@ async function decidePayment(
       updatedAt: FieldValue.serverTimestamp(),
     });
 
+    paymentNotification.value = {
+      customerId:
+        typeof data['customerId'] === 'string' ? data['customerId'] : '',
+      decision,
+      revision: audit.length,
+    };
+
     return { id: orderId, paymentStatus: decision };
   });
+
+  const pendingNotification = paymentNotification.value;
+  if (pendingNotification) {
+    await notifyPaymentDecision(
+      orderId,
+      pendingNotification.customerId,
+      pendingNotification.decision,
+      pendingNotification.revision
+    );
+  }
+
+  return result;
 }
 
 /** Records an admin PAID/REJECTED decision on a GCash payment (GCash only). */
@@ -1170,10 +1176,10 @@ export function decideOrderPayment(
 /**
  * Explicitly confirms that cash was collected for a COD order.
  *
- * Completing a COD order marks it PAID automatically because cash is collected
- * on delivery; this action exists for legacy completed orders that are still
- * `PENDING`. It requires `orderStatus === 'COMPLETED'`, is an idempotent no-op
- * once paid, and a confirmed payment can never be overwritten.
+ * Fulfilment and payment are independent: reaching `COMPLETED` never changes
+ * `paymentStatus`. The admin records collection through this action once cash
+ * was actually received. It requires `orderStatus === 'COMPLETED'`, is an
+ * idempotent no-op once paid, and a confirmed payment can never be overwritten.
  */
 export function confirmCodPayment(
   admin: { uid: string },

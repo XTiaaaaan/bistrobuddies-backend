@@ -16,6 +16,7 @@ export type OrderStatus =
   | 'CONFIRMED'
   | 'PREPARING'
   | 'READY'
+  | 'OUT_FOR_DELIVERY'
   | 'COMPLETED'
   | 'CANCELLED';
 
@@ -34,19 +35,48 @@ export const ORDER_STATUSES: OrderStatus[] = [
   'CONFIRMED',
   'PREPARING',
   'READY',
+  'OUT_FOR_DELIVERY',
   'COMPLETED',
   'CANCELLED',
 ];
 
-/** Allowed order status transitions (server-enforced). */
+/**
+ * User-facing labels for the internal order statuses. `OUT_FOR_DELIVERY` is
+ * stored exactly as-is and displayed as "On the Way".
+ */
+export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
+  PENDING: 'Pending',
+  CONFIRMED: 'Confirmed',
+  PREPARING: 'Preparing',
+  READY: 'Ready',
+  OUT_FOR_DELIVERY: 'On the Way',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+};
+
+/**
+ * Allowed order status transitions (server-enforced).
+ *
+ * Delivery orders follow `CONFIRMED -> PREPARING -> READY ->
+ * OUT_FOR_DELIVERY -> COMPLETED`. Pickup orders skip the delivery hop and go
+ * `READY -> COMPLETED`; both transitions are allowed so the flow never forces
+ * a pickup order to be marked out for delivery. `OUT_FOR_DELIVERY` is only
+ * reachable from `READY`, so an order cannot be dispatched before it is ready.
+ */
 export const ORDER_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   PENDING: ['CONFIRMED', 'CANCELLED'],
   CONFIRMED: ['PREPARING', 'CANCELLED'],
   PREPARING: ['READY', 'CANCELLED'],
-  READY: ['COMPLETED', 'CANCELLED'],
+  READY: ['OUT_FOR_DELIVERY', 'COMPLETED', 'CANCELLED'],
+  OUT_FOR_DELIVERY: ['COMPLETED', 'CANCELLED'],
   COMPLETED: [],
   CANCELLED: [],
 };
+
+/** Returns the user-facing label for an order status. */
+export function orderStatusLabel(status: string): string {
+  return ORDER_STATUS_LABELS[status as OrderStatus] ?? status;
+}
 
 export const MAX_ORDER_ITEMS = 50;
 export const MAX_QUANTITY = 99;
@@ -764,8 +794,9 @@ export function readContactMessageId(raw: string): string {
  * - `REJECTED` — an admin rejected the payment; the customer may resubmit,
  *   which moves the order back to `VERIFYING`.
  *
- * COD orders never leave `PENDING`. Confirming payment never changes the
- * separate fulfilment field `orderStatus`.
+ * COD orders stay `PENDING` until an admin explicitly records cash collection;
+ * completing an order never changes payment. Confirming payment never changes
+ * the separate fulfilment field `orderStatus`.
  */
 export type PaymentStatus = 'PENDING' | 'VERIFYING' | 'PAID' | 'REJECTED';
 
@@ -911,6 +942,82 @@ export function validateRefundAction(body: unknown): RefundActionInput {
     );
   }
   return { action, confirmed };
+}
+
+/** Platforms a registered FCM device token can report. */
+export type DevicePlatform = 'android' | 'ios' | 'web' | 'unknown';
+
+export const DEVICE_PLATFORMS: DevicePlatform[] = [
+  'android',
+  'ios',
+  'web',
+  'unknown',
+];
+
+export const MAX_DEVICE_TOKEN_LENGTH = 4096;
+
+export interface DeviceTokenInput {
+  token: string;
+  platform: DevicePlatform;
+}
+
+function readDeviceToken(source: Record<string, unknown>, issues: Issues): string {
+  const raw = source['token'];
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    issues.add('token', 'token is required.');
+    return '';
+  }
+  const token = raw.trim();
+  if (token.length > MAX_DEVICE_TOKEN_LENGTH) {
+    issues.add(
+      'token',
+      `token must be at most ${MAX_DEVICE_TOKEN_LENGTH} characters.`
+    );
+  } else if (/\s/.test(token)) {
+    issues.add('token', 'token must not contain whitespace.');
+  }
+  return token;
+}
+
+/**
+ * Validates POST /api/notifications/devices bodies.
+ *
+ * Only the FCM registration `token` and an optional `platform` are read. The
+ * owning uid always comes from the verified auth token, never the body.
+ */
+export function validateDeviceTokenRegistration(
+  body: unknown
+): DeviceTokenInput {
+  const source = asObject(body);
+  const issues = new Issues();
+  const token = readDeviceToken(source, issues);
+
+  let platform: DevicePlatform = 'unknown';
+  const platformRaw = source['platform'];
+  if (platformRaw !== undefined && platformRaw !== null && platformRaw !== '') {
+    const normalized =
+      typeof platformRaw === 'string' ? platformRaw.trim().toLowerCase() : '';
+    if (!DEVICE_PLATFORMS.includes(normalized as DevicePlatform)) {
+      issues.add(
+        'platform',
+        `platform must be one of: ${DEVICE_PLATFORMS.join(', ')}.`
+      );
+    } else {
+      platform = normalized as DevicePlatform;
+    }
+  }
+
+  issues.throwIfAny('The device token payload is invalid.');
+  return { token, platform };
+}
+
+/** Validates DELETE /api/notifications/devices bodies. */
+export function validateDeviceTokenRemoval(body: unknown): { token: string } {
+  const source = asObject(body);
+  const issues = new Issues();
+  const token = readDeviceToken(source, issues);
+  issues.throwIfAny('The device token payload is invalid.');
+  return { token };
 }
 
 /** Validates POST /api/admin/orders/:id/status body. */
