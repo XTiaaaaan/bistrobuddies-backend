@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { notFound } from '../errors';
+import { parseMultipartImage } from '../lib/image-upload';
 import {
   validateCreateOrderRequest,
   validateGcashDetails,
@@ -16,6 +17,7 @@ import {
   createOrder,
   getOrder,
   submitGcashDetails,
+  submitGcashProof,
 } from '../services/orders.service';
 
 export const ordersRouter = Router();
@@ -109,4 +111,43 @@ ordersRouter.post(
     const result = await submitGcashDetails(user, orderId, input);
     res.json(result);
   })
+);
+
+const paymentProofHandler = asyncHandler(async (req, res) => {
+  const user = getAuth(req);
+  const orderId = (req.params['id'] ?? '').trim();
+  if (!orderId || orderId.length > 128) {
+    throw notFound('order_not_found', 'This order no longer exists.');
+  }
+  const result = await submitGcashProof(user, orderId, req.file);
+  res.status(201).json(result);
+});
+
+/**
+ * POST /api/orders/:id/payment-proof — upload GCash payment proof (owner only).
+ *
+ * `multipart/form-data` with exactly one image in the field named `file`:
+ * JPEG/PNG/WebP by magic bytes, at most `UPLOAD_MAX_BYTES` (default 5 MB).
+ * The customer identity comes from the verified token and the order must
+ * belong to that customer, use GCASH, and not already be PAID. On success the
+ * image is stored in Cloudinary and only its HTTPS URL/metadata are written to
+ * the order; `paymentStatus` moves to VERIFYING (never PAID automatically).
+ * Proof may be replaced while VERIFYING or after a REJECTED decision.
+ *
+ * `/gcash-proof` is an equivalent alias for clients using that name.
+ */
+ordersRouter.post(
+  '/orders/:id/payment-proof',
+  rateLimit({ name: 'orders-gcash-proof', limit: 20, windowMs: 60_000 }),
+  requireAuth,
+  parseMultipartImage,
+  paymentProofHandler
+);
+
+ordersRouter.post(
+  '/orders/:id/gcash-proof',
+  rateLimit({ name: 'orders-gcash-proof', limit: 20, windowMs: 60_000 }),
+  requireAuth,
+  parseMultipartImage,
+  paymentProofHandler
 );

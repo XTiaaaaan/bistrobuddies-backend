@@ -43,7 +43,10 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | GET | `/api/orders/:id` | Bearer (owner or admin) | Others get `404 order_not_found` (no id probing) |
 | POST | `/api/orders/:id/cancel` | Bearer (order owner) | Cancel a `PENDING` order (sets `orderStatus: CANCELLED`, never deletes) → full order (§4) |
 | POST | `/api/orders/:id/gcash-details` | Bearer (order owner) | Submit GCash details for manual verification → `{ id, paymentStatus }` (§4) |
-| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment → `{ id, paymentStatus }` (§4) |
+| POST | `/api/orders/:id/payment-proof` | Bearer (order owner) | Upload mandatory GCash proof (multipart `file`, JPEG/PNG/WebP, ≤5 MB) → `201 { id, paymentStatus, paymentProof }`; alias `/gcash-proof` (§4) |
+| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm COD collection → `{ id, paymentStatus }` (§4) |
+| POST | `/api/admin/orders/:id/payment-proof` | Bearer (admin) | Alias of `/payment` for proof review (§4) |
+| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Explicitly confirm COD cash collection → `{ id, paymentStatus: "PAID" }` (§4) |
 | POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` (§4) |
 | POST | `/api/contact-messages` | Bearer (any signed-in user) | Stores a "Contact Us" submission → `201 { id, status }` (§4) |
 | GET | `/api/contact-messages/mine` | Bearer (any signed-in user) | The caller's own messages, newest first → `{ messages: [...] }` (§4) |
@@ -202,12 +205,17 @@ Full stored order: `id`, `customerId`, `customerSnapshot`, `addressSnapshot`,
 `items` (with purchase-time `unitPrice`/`subtotal` snapshots), `subtotal`,
 `deliveryFee`, `total`, `currency`, `customerComment`, `paymentMethod`,
 `paymentStatus`, `gcashDetails` (`null` when none submitted yet),
+`paymentProof` (`null` when none uploaded) and its aliases `gcashProof`,
+`paymentProofUrl`, `proofUrl`, `gcashProofUrl`,
 `refund` (`{ status, amount, requestedAt, completedAt }` refund facts — see
 "Manual refunds"; `NOT_REFUNDED` unless a refund was recorded),
 `orderStatus`, `createdAt`, `updatedAt`.
+`paymentProof` is `{ url, publicId, mimeType, size, submittedBy, submittedAt }`;
+only this URL/metadata is stored in Firestore — never image bytes or base64.
 Historical orders are returned **exactly as stored** — prices are never
-recomputed or rewritten, and orders without the newer GCash/refund fields come
-back with `gcashDetails: null` and `refund: NOT_REFUNDED`.
+recomputed or rewritten, and orders without the newer GCash/proof/refund fields
+come back with `gcashDetails: null`, `paymentProof: null` and
+`refund: NOT_REFUNDED`.
 Administrators additionally receive `paymentDecision` (latest admin decision
 with `decidedBy`/`decidedAt`), `paymentAudit` (append-only status trail) and
 `refundAudit` (append-only refund trail); these fields are omitted from
@@ -218,6 +226,7 @@ customer responses.
 `PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; `CANCELLED` reachable
 from every non-terminal state. Re-sending the current status is an
 idempotent no-op; anything else → `400 invalid_status_transition`.
+Transitions, including `COMPLETED`, never change `paymentStatus`.
 
 ### Customer order cancellation
 
@@ -248,26 +257,32 @@ the same shape as `GET /api/orders/:id`.
 
 The GCash QR image lives in the mobile app assets (not in this backend).
 The flow is: customer pays via their own GCash app → submits their GCash
-account name + mobile number here for reference → an admin verifies the
-payment out-of-band and records the decision here. The submitted name never
-proves payment; only an admin decision marks an order `PAID`.
+account name + mobile number **and a payment proof image** here → an admin
+reviews the proof and records the decision here. The submitted name/details do
+not prove payment on their own; only an admin decision marks a GCash order
+`PAID`, and that decision requires proof to have been submitted.
+
+`orderStatus` and `paymentStatus` remain independent: completing an order
+(including COD) never marks it paid. COD orders stay `PENDING` until an admin
+explicitly confirms cash collection (see "COD collection").
 
 **Payment-status transitions** (`paymentStatus` is independent of the
 fulfilment field `orderStatus`; confirming payment never completes an order):
 
 | From | To | By | Notes |
 | --- | --- | --- | --- |
-| `PENDING` | `VERIFYING` | customer (`POST …/gcash-details`) | first submission |
-| `VERIFYING` | `VERIFYING` | customer | safe resubmission; latest details win |
+| `PENDING` | `VERIFYING` | customer (`POST …/gcash-details` or proof) | first submission |
+| `VERIFYING` | `VERIFYING` | customer | safe resubmission; latest details/proof win |
 | `REJECTED` | `VERIFYING` | customer | resubmission after a rejection |
-| `VERIFYING` | `PAID` | admin (`POST …/payment`) | confirmation |
+| `VERIFYING` | `PAID` | admin (`POST …/payment` or `…/payment-proof`) | confirmation; proof required |
 | `VERIFYING` | `REJECTED` | admin | rejection |
 | `PAID` | `PAID` | admin | idempotent no-op (writes nothing) |
 | `REJECTED` | `REJECTED` | admin | idempotent no-op (writes nothing) |
 
 Anything else is rejected: `PAID` can never be overwritten, `REJECTED` can
 only become `PAID` after the customer resubmits (never directly), and an
-admin cannot decide before details exist (`409 payment_details_required`).
+admin cannot approve before details/proof exist
+(`409 payment_details_required` / `409 payment_proof_required`).
 A customer can never mark an order `PAID` — there is no customer-facing
 endpoint that writes `PAID`.
 
@@ -292,6 +307,34 @@ endpoint that writes `PAID`.
   (non-GCash order, e.g. COD); `409 payment_already_confirmed` (already
   `PAID`).
 
+**Customer — POST /api/orders/:id/payment-proof** (owner only, 20/min/IP;
+alias `POST /api/orders/:id/gcash-proof`):
+
+Mandatory proof upload for GCash orders. `multipart/form-data` with exactly one
+`file` field. The file is validated by magic bytes (JPEG/PNG/WebP), limited to
+5 MB, uploaded to Cloudinary, and only its URL/metadata are written to the
+order. Image bytes/base64 are never stored in Firestore.
+
+```jsonc
+// response 201
+{ "id": "…", "paymentStatus": "VERIFYING",
+  "paymentProof": { "url": "https://res.cloudinary.com/…", "publicId": "…",
+                    "mimeType": "image/jpeg", "size": 123456,
+                    "submittedBy": "uid", "submittedAt": "…" } }
+```
+
+- The customer must own the order, the order must use `GCASH`, and the payment
+  must not already be `PAID`.
+- A PENDING order moves to `VERIFYING`; an existing `VERIFYING` proof may be
+  replaced, and a `REJECTED` payment may be resubmitted with a new proof.
+- If the Cloudinary upload succeeds but the Firestore write fails, the new
+  asset is deleted best-effort and the request fails with the server error:
+  there is no orphaned proof URL on the order.
+- Errors: `401 unauthorized`; `404 order_not_found`; `400 invalid_request`
+  (missing file, per-field `details`); `400 invalid_image_type`;
+  `413 file_too_large`; `409 invalid_payment_method` (non-GCash order);
+  `409 payment_already_confirmed` (already `PAID`).
+
 **Admin — POST /api/admin/orders/:id/payment** (admin only, 60/min/IP):
 
 ```jsonc
@@ -301,17 +344,31 @@ endpoint that writes `PAID`.
 { "id": "…", "paymentStatus": "PAID" }
 ```
 
-- The order must use `GCASH` and be `VERIFYING` with submitted details.
+- For a GCash `PAID` decision the order must be `VERIFYING` with submitted
+  details **and** proof (`409 payment_details_required` /
+  `409 payment_proof_required` otherwise). Rejection only requires details.
+- For a COD order, this same endpoint may confirm collection with
+  `{ "decision": "PAID" }`; COD `REJECTED` is not a valid collection state
+  (`409 invalid_payment_transition`). `POST …/payment-proof` is an alias of
+  this endpoint.
 - The admin UID and decision timestamp are stored (`paymentDecision`) and an
   entry is appended to `paymentAudit`; `orderStatus` is never changed here.
 - All writes run in a Firestore transaction, so repeated or concurrent
   identical decisions stay consistent (the repeat is a no-op).
 - Errors: `401 unauthorized`; `403 forbidden` (non-admin);
   `404 order_not_found`; `400 invalid_request` (bad `decision`);
-  `409 invalid_payment_method` (non-GCash order);
-  `409 payment_details_required` (still `PENDING`);
-  `409 invalid_payment_transition` (overwriting `PAID`, or `REJECTED → PAID`
-  without a customer resubmission).
+  `409 invalid_payment_method`; `409 payment_details_required`;
+  `409 payment_proof_required`;
+  `409 invalid_payment_transition` (overwriting `PAID`, `REJECTED → PAID`
+  without a customer resubmission, or COD rejection).
+
+**Admin — POST /api/admin/orders/:id/cod-payment** (admin only, 60/min/IP):
+
+Explicitly records that cash was collected for a COD order. The optional body
+may be `{ "decision": "PAID" }` or omitted. Only `COD` orders are accepted, and
+only `PAID` is a valid target; the order status is untouched, so an order can
+be `COMPLETED` with its payment still `PENDING` until this action runs. Like
+the GCash decision, it is transactional and idempotent.
 
 ### Manual refunds (no gateway)
 

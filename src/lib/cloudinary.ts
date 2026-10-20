@@ -122,3 +122,36 @@ export async function uploadToCloudinary(
     size: buffer.length,
   };
 }
+
+/**
+ * Best-effort removal of a previously uploaded Cloudinary image.
+ *
+ * Used to clean up an orphaned asset when the database write that was meant
+ * to associate it fails after the upload succeeded. This deliberately never
+ * throws: the caller has already hit a more important error, and a failed
+ * cleanup must not turn it into a misleading upload error. Returns `true`
+ * when the asset was removed (or no longer exists), `false` otherwise.
+ */
+export async function deleteFromCloudinary(publicId: string): Promise<boolean> {
+  if (!publicId || !isCloudinaryConfigured()) {
+    return false;
+  }
+  const { cloudName, apiKey, apiSecret } = cloudinaryCredentials();
+
+  cloudinary.config({
+    cloud_name: cloudName,
+    api_key: apiKey,
+    api_secret: apiSecret,
+    secure: true,
+  });
+
+  try {
+    const result = (await cloudinary.uploader.destroy(publicId, {
+      resource_type: 'image',
+      invalidate: true,
+    })) as { result?: string };
+    return result?.result === 'ok' || result?.result === 'not found';
+  } catch {
+    return false;
+  }
+}

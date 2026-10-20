@@ -11,7 +11,11 @@ import {
 import { getAuth, requireAdmin, requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
-import { decideGcashPayment, recordRefundAction } from '../services/orders.service';
+import {
+  confirmCodPayment,
+  decideOrderPayment,
+  recordRefundAction,
+} from '../services/orders.service';
 
 export const adminOrdersRouter = Router();
 
@@ -76,13 +80,19 @@ adminOrdersRouter.post(
 );
 
 /**
- * POST /api/admin/orders/:id/payment — confirm or reject a GCash payment (admin only).
+ * POST /api/admin/orders/:id/payment — record a payment decision (admin only).
  *
- * Body: `{ "decision": "PAID" | "REJECTED" }`. The order must use paymentMethod
- * GCASH and currently be VERIFYING with submitted customer details. Repeating
- * the recorded decision is an idempotent no-op; a confirmed (PAID) payment can
- * never be overwritten, and REJECTED can only become PAID after the customer
- * resubmits details. Recording a decision never changes `orderStatus`.
+ * Body: `{ "decision": "PAID" | "REJECTED" }`.
+ *
+ * - GCash: the order must be VERIFYING with submitted details **and** an
+ *   uploaded payment proof before PAID is accepted. Repeating the recorded
+ *   decision is an idempotent no-op; a confirmed (PAID) payment can never be
+ *   overwritten, and REJECTED can only become PAID after the customer
+ *   resubmits proof/details.
+ * - COD: only `PAID` is accepted, recorded by the admin when cash was
+ *   actually collected. Completing an order never marks COD paid by itself.
+ *
+ * Recording a decision never changes `orderStatus`.
  */
 adminOrdersRouter.post(
   '/orders/:id/payment',
@@ -95,7 +105,60 @@ adminOrdersRouter.post(
 
     const decision = validatePaymentDecision(req.body);
     const admin = getAuth(req);
-    const result = await decideGcashPayment(admin, orderId, decision);
+    const result = await decideOrderPayment(admin, orderId, decision);
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/admin/orders/:id/payment-proof — alias of the payment decision
+ * endpoint, provided so clients can name the action they are reviewing.
+ */
+adminOrdersRouter.post(
+  '/orders/:id/payment-proof',
+  ...adminGuard,
+  asyncHandler(async (req, res) => {
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw new ApiError(400, 'invalid_request', 'A valid order id is required.');
+    }
+
+    const decision = validatePaymentDecision(req.body);
+    const admin = getAuth(req);
+    const result = await decideOrderPayment(admin, orderId, decision);
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/admin/orders/:id/cod-payment — confirm COD cash collection.
+ *
+ * Explicit, authorized action that marks a COD order's independent
+ * `paymentStatus` as PAID. An optional `{ "decision": "PAID" }` body is also
+ * accepted; REJECTED is not meaningful for COD. Idempotent and never changes
+ * `orderStatus`.
+ */
+adminOrdersRouter.post(
+  '/orders/:id/cod-payment',
+  ...adminGuard,
+  asyncHandler(async (req, res) => {
+    const orderId = (req.params['id'] ?? '').trim();
+    if (!orderId || orderId.length > 128) {
+      throw new ApiError(400, 'invalid_request', 'A valid order id is required.');
+    }
+    if (req.body !== undefined && req.body !== null && typeof req.body === 'object') {
+      const raw = (req.body as Record<string, unknown>)['decision'];
+      if (raw !== undefined && raw !== 'PAID') {
+        throw new ApiError(
+          409,
+          'invalid_payment_method',
+          'Cash-on-delivery payments can only be marked as collected (PAID).'
+        );
+      }
+    }
+
+    const admin = getAuth(req);
+    const result = await confirmCodPayment(admin, orderId);
     res.json(result);
   })
 );

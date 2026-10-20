@@ -66,6 +66,7 @@ Every route exists at both `/api/<path>` and `/<path>` (see §2).
 | GET | `/api/orders/:id` | `src/routes/orders.ts` | Bearer (owner or admin) | 120/min/IP |
 | POST | `/api/orders/:id/cancel` | `src/routes/orders.ts` | Bearer (owner) | 20/min/IP |
 | POST | `/api/orders/:id/gcash-details` | `src/routes/orders.ts` | Bearer (owner) | 20/min/IP |
+| POST | `/api/orders/:id/payment-proof` (alias `/gcash-proof`) | `src/routes/orders.ts` | Bearer (owner) | 20/min/IP |
 | POST | `/api/contact-messages` | `src/routes/contact-messages.ts` | Bearer (any signed-in user) | 10/min/IP |
 | GET | `/api/contact-messages/mine` | `src/routes/contact-messages.ts` | Bearer (any signed-in user) | 60/min/IP |
 | POST | `/api/admin/products` | `src/routes/admin-products.ts` | Bearer + admin | 60/min/IP |
@@ -75,6 +76,8 @@ Every route exists at both `/api/<path>` and `/<path>` (see §2).
 | POST | `/api/profile/photo` | `src/routes/profile-uploads.ts` | Bearer (any signed-in user) | 30/min/IP |
 | POST | `/api/admin/orders/:id/status` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
 | POST | `/api/admin/orders/:id/payment` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/orders/:id/payment-proof` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
+| POST | `/api/admin/orders/:id/cod-payment` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
 | POST | `/api/admin/orders/:id/refund` | `src/routes/admin-orders.ts` | Bearer + admin | 60/min/IP |
 | GET | `/api/admin/contact-messages` | `src/routes/admin-contact-messages.ts` | Bearer + admin | 60/min/IP |
 | PATCH | `/api/admin/contact-messages/:id/status` | `src/routes/admin-contact-messages.ts` | Bearer + admin | 60/min/IP |
@@ -137,6 +140,9 @@ addressSnapshot{recipientName,phone,address,city?,postalCode?},
 items[{productId,productName,imageUrl,size,sugar,quantity,unitPrice,subtotal}],
 subtotal, deliveryFee, total, customerComment,
 paymentMethod: 'COD'|'GCASH', paymentStatus: 'PENDING', orderStatus: 'PENDING',
+gcashDetails?{accountName,accountNumber,submittedBy,submittedAt},
+paymentProof?{url,publicId,mimeType,size,submittedBy,submittedAt},
+paymentDecision?{decision,decidedBy,decidedAt}, paymentAudit[]?,
 createdAt, updatedAt
 ```
 
@@ -244,8 +250,8 @@ Tests need no network or credentials (Firebase and Cloudinary are mocked in the 
 | Trusted API, server-side order calculations | ✅ **WORKS** | `src/services/orders.service.ts:45-106`; proven by `src/app.test.ts:230-255` |
 | Product CRUD | ✅ **WORKS** | Create/update/delete (admin) plus public reads `GET /api/products[/:id]` (`src/routes/products.ts`) |
 | Admin authorization | ✅ **WORKS** | `requireAuth` + `requireAdmin` on all 4 admin routes; 401/403 tested (`src/app.test.ts:337-353,470-475`) |
-| Admin order management | ⚠️ **PARTIAL** | Status transition, GCash payment decision and manual refunds exist; **no admin order list endpoint** |
-| Image uploads (Cloudinary) | ✅ **WORKS** | `POST /api/admin/uploads` (admin) and `POST /api/profile/photo` (any signed-in user) — multer memory parse, magic-byte type check, 5 MB cap, rate-limited, stored in Cloudinary. See §14, `README.md`, `docs/API_CONTRACT.md` §6 |
+| Admin order management | ⚠️ **PARTIAL** | Status transition, GCash proof review/payment decisions, explicit COD collection and manual refunds exist; **no admin order list endpoint** |
+| Image uploads (Cloudinary) | ✅ **WORKS** | `POST /api/admin/uploads` (admin), `POST /api/profile/photo` (any signed-in user) and GCash `POST /api/orders/:id/payment-proof` (order owner) — multer memory parse, magic-byte type check, 5 MB cap, rate-limited, stored in Cloudinary. See §14, `README.md`, `docs/API_CONTRACT.md` §6 |
 | Firebase Storage | ❌ **NOT USED** | Intentional — permanent image hosting is Cloudinary (§14); no `getStorage`/`bucket()` usage |
 | PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'GCASH'` is manual verification only (`src/services/orders.service.ts:89`) |
 | Secrets server-side | ✅ **WORKS** | No secrets in repo; `.env.example` placeholders empty |
