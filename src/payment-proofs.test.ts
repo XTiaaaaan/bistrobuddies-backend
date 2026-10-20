@@ -664,15 +664,38 @@ describe('GCash payment proof and payment status correction', () => {
   });
 
   describe('COD and independent payment status', () => {
-    it('does not mark COD PAID merely because the order is COMPLETED', async () => {
+    it('marks COD PAID when the order becomes COMPLETED', async () => {
       const response = await status('cod-pending', 'CONFIRMED');
       expect(response.status).toBe(200);
       await status('cod-pending', 'PREPARING');
       await status('cod-pending', 'READY');
       const completed = await status('cod-pending', 'COMPLETED');
       expect(completed.status).toBe(200);
+      expect(await completed.json()).toMatchObject({
+        id: 'cod-pending',
+        orderStatus: 'COMPLETED',
+        paymentStatus: 'PAID',
+      });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(stored('cod-pending')['orderStatus']).toBe('COMPLETED');
+      expect(stored('cod-pending')['paymentStatus']).toBe('PAID');
+      const audit = stored('cod-pending')['paymentAudit'] as Array<
+        Record<string, unknown>
+      >;
+      expect(audit[audit.length - 1]).toMatchObject({
+        from: 'PENDING',
+        to: 'PAID',
+        actorUid: 'admin-1',
+        actorRole: 'admin',
+      });
+    });
+
+    it('refuses to collect COD before the order is COMPLETED', async () => {
+      const response = await confirmCod('cod-pending', 'valid-admin');
+      expect(response.status).toBe(409);
+      expect(
+        ((await response.json()) as { error: { code: string } }).error.code
+      ).toBe('invalid_payment_transition');
       expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
     });
 

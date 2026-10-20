@@ -226,7 +226,9 @@ customer responses.
 `PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; `CANCELLED` reachable
 from every non-terminal state. Re-sending the current status is an
 idempotent no-op; anything else → `400 invalid_status_transition`.
-Transitions, including `COMPLETED`, never change `paymentStatus`.
+Moving a COD order to `COMPLETED` also writes `paymentStatus: "PAID"` (cash is
+collected on delivery) and appends a `paymentAudit` entry. GCash payment status
+is never changed by a status transition.
 
 ### Customer order cancellation
 
@@ -262,9 +264,10 @@ reviews the proof and records the decision here. The submitted name/details do
 not prove payment on their own; only an admin decision marks a GCash order
 `PAID`, and that decision requires proof to have been submitted.
 
-`orderStatus` and `paymentStatus` remain independent: completing an order
-(including COD) never marks it paid. COD orders stay `PENDING` until an admin
-explicitly confirms cash collection (see "COD collection").
+`orderStatus` and `paymentStatus` remain independent for GCash: completing a
+GCash order never marks it paid. For COD, cash is collected on delivery, so
+moving the order to `COMPLETED` marks it `PAID` in the same write (see "COD
+collection").
 
 **Payment-status transitions** (`paymentStatus` is independent of the
 fulfilment field `orderStatus`; confirming payment never completes an order):
@@ -278,6 +281,8 @@ fulfilment field `orderStatus`; confirming payment never completes an order):
 | `VERIFYING` | `REJECTED` | admin | rejection |
 | `PAID` | `PAID` | admin | idempotent no-op (writes nothing) |
 | `REJECTED` | `REJECTED` | admin | idempotent no-op (writes nothing) |
+| `PENDING` | `PAID` | admin (`POST …/status` → `COMPLETED`, COD only) | automatic cash settlement on delivery |
+| `PENDING` | `PAID` | admin (`POST …/cod-payment`, COD only) | legacy completed orders only |
 
 Anything else is rejected: `PAID` can never be overwritten, `REJECTED` can
 only become `PAID` after the customer resubmits (never directly), and an
@@ -348,9 +353,10 @@ order. Image bytes/base64 are never stored in Firestore.
   details **and** proof (`409 payment_details_required` /
   `409 payment_proof_required` otherwise). Rejection only requires details.
 - For a COD order, this same endpoint may confirm collection with
-  `{ "decision": "PAID" }`; COD `REJECTED` is not a valid collection state
-  (`409 invalid_payment_transition`). `POST …/payment-proof` is an alias of
-  this endpoint.
+  `{ "decision": "PAID" }` only once the order is `COMPLETED`; COD `REJECTED`
+  is not a valid collection state, and unfinished COD orders are refused with
+  `409 invalid_payment_transition`. `POST …/payment-proof` is an alias of this
+  endpoint.
 - The admin UID and decision timestamp are stored (`paymentDecision`) and an
   entry is appended to `paymentAudit`; `orderStatus` is never changed here.
 - All writes run in a Firestore transaction, so repeated or concurrent
@@ -365,10 +371,11 @@ order. Image bytes/base64 are never stored in Firestore.
 **Admin — POST /api/admin/orders/:id/cod-payment** (admin only, 60/min/IP):
 
 Explicitly records that cash was collected for a COD order. The optional body
-may be `{ "decision": "PAID" }` or omitted. Only `COD` orders are accepted, and
-only `PAID` is a valid target; the order status is untouched, so an order can
-be `COMPLETED` with its payment still `PENDING` until this action runs. Like
-the GCash decision, it is transactional and idempotent.
+may be `{ "decision": "PAID" }` or omitted. Only `COD` orders that are already
+`COMPLETED` are accepted, and only `PAID` is a valid target; the order status
+is untouched. Normal orders are settled automatically when they reach
+`COMPLETED`, so this action is for legacy completed orders still stored as
+`PENDING`. Like the GCash decision, it is transactional and idempotent.
 
 ### Manual refunds (no gateway)
 

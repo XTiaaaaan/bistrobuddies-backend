@@ -250,7 +250,7 @@ Tests need no network or credentials (Firebase and Cloudinary are mocked in the 
 | Trusted API, server-side order calculations | ✅ **WORKS** | `src/services/orders.service.ts:45-106`; proven by `src/app.test.ts:230-255` |
 | Product CRUD | ✅ **WORKS** | Create/update/delete (admin) plus public reads `GET /api/products[/:id]` (`src/routes/products.ts`) |
 | Admin authorization | ✅ **WORKS** | `requireAuth` + `requireAdmin` on all 4 admin routes; 401/403 tested (`src/app.test.ts:337-353,470-475`) |
-| Admin order management | ⚠️ **PARTIAL** | Status transition, GCash proof review/payment decisions, explicit COD collection and manual refunds exist; **no admin order list endpoint** |
+| Admin order management | ⚠️ **PARTIAL** | Status transition (COD settles to PAID on `COMPLETED`), GCash proof review/payment decisions, legacy COD collection and manual refunds exist; **no admin order list endpoint** |
 | Image uploads (Cloudinary) | ✅ **WORKS** | `POST /api/admin/uploads` (admin), `POST /api/profile/photo` (any signed-in user) and GCash `POST /api/orders/:id/payment-proof` (order owner) — multer memory parse, magic-byte type check, 5 MB cap, rate-limited, stored in Cloudinary. See §14, `README.md`, `docs/API_CONTRACT.md` §6 |
 | Firebase Storage | ❌ **NOT USED** | Intentional — permanent image hosting is Cloudinary (§14); no `getStorage`/`bucket()` usage |
 | PayMongo sandbox + webhook verification | ❌ **MISSING** | Zero matches for `paymongo|webhook|signature|Hmac` in `package.json`, `src/`, `api/`. `paymentMethod: 'GCASH'` is manual verification only (`src/services/orders.service.ts:89`) |

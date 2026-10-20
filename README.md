@@ -67,10 +67,10 @@ Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 | POST | `/api/admin/uploads` | Bearer (admin) | Stores a product image in Cloudinary → `{ imageUrl, publicId, … }`. 30 req/min/IP (see below) |
 | POST | `/api/profile/photo` | Bearer (customer) | Stores the caller's profile picture in Cloudinary. 30 req/min/IP |
 | GET | `/uploads/:file` | — (public read) | Serves **legacy** local images read-only (new uploads go to Cloudinary) |
-| POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status) |
-| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm COD collection → `{ id, paymentStatus }` |
+| POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status); `COMPLETED` settles COD to `PAID` |
+| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm legacy COD collection (completed orders only) → `{ id, paymentStatus }` |
 | POST | `/api/admin/orders/:id/payment-proof` | Bearer (admin) | Alias of `/payment` for reviewing submitted proof |
-| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Explicitly confirm COD cash collection → `{ id, paymentStatus: "PAID" }` |
+| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Confirm legacy COD cash collection on a completed order → `{ id, paymentStatus: "PAID" }` |
 | POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` |
 | GET | `/api/admin/contact-messages` | Bearer (admin) | Lists customer "Contact Us" messages, newest first (`?status=NEW\|READ\|RESOLVED`, `?page`, `?pageSize`). 60 req/min/IP |
 | PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | Sets `status` to `READ` or `RESOLVED` → `{ id, status }` |
@@ -84,11 +84,14 @@ response shapes: **`docs/API_CONTRACT.md`**.
 ### Payment status and GCash proof
 
 `orderStatus` (fulfilment) and `paymentStatus` (money) are independent. Moving
-an order to `COMPLETED` never marks it paid: COD is confirmed through the
-explicit admin action `POST /api/admin/orders/:id/cod-payment` (or the same
-`/payment` endpoint with `{ "decision": "PAID" }`), and GCash becomes `PAID`
-only when an administrator confirms it after reviewing the customer's submitted
-details **and proof**.
+a COD order to `COMPLETED` marks it `PAID` in the same write, because cash is
+collected on delivery. GCash becomes `PAID` only when an administrator confirms
+it after reviewing the customer's submitted details **and proof**.
+
+The explicit admin actions `POST /api/admin/orders/:id/cod-payment` (or
+`/payment` with `{ "decision": "PAID" }`) remain available for legacy completed
+COD orders that are still `PENDING`; they require the order to be `COMPLETED`
+and never change `orderStatus`.
 
 The mandatory GCash proof is uploaded by the order owner via
 `POST /api/orders/:id/payment-proof` (alias `/gcash-proof`) as
