@@ -8,6 +8,7 @@ import {
 } from 'firebase-admin/app';
 import { Auth, DecodedIdToken, getAuth } from 'firebase-admin/auth';
 import { Firestore, getFirestore } from 'firebase-admin/firestore';
+import { Messaging, getMessaging } from 'firebase-admin/messaging';
 import { config } from '../config';
 import { ServerNotConfiguredError } from '../errors';
 import { logger } from '../logger';
@@ -15,6 +16,8 @@ import { logger } from '../logger';
 export interface FirebaseRuntime {
   auth: Auth;
   db: Firestore;
+  /** Firebase Cloud Messaging (same project/service account as Firestore). */
+  messaging: Messaging;
 }
 
 export type { DecodedIdToken };
@@ -76,7 +79,11 @@ function ensureInitialized(): FirebaseRuntime | null {
       }
       app = initializeApp(options);
     }
-    runtime = { auth: getAuth(app), db: getFirestore(app) };
+    runtime = {
+      auth: getAuth(app),
+      db: getFirestore(app),
+      messaging: getMessaging(app),
+    };
     initFailure = null;
     logger.info('Firebase Admin initialized.', {
       projectId: config.firebaseProjectId,

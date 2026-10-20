@@ -74,6 +74,21 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
+    // deviceTokens: FCM registration tokens. Managed exclusively through the
+    // authenticated API (POST/DELETE /api/notifications/devices) so a token is
+    // always bound to the token owner and users cannot read or revoke someone
+    // else's devices. Direct client access is denied.
+    match /deviceTokens/{tokenHash} {
+      allow read, write: if false;
+    }
+
+    // notifications: server-side idempotency/audit records for push events.
+    // Clients never read or write these documents; the Admin SDK bypasses
+    // these rules. Denying all access keeps delivery metadata private.
+    match /notifications/{eventId} {
+      allow read, write: if false;
+    }
+
     // contactMessages: customer "Contact Us" submissions, including admin
     // replies stored in each document's `replies` array. Only the trusted
     // backend writes them (POST /api/contact-messages and

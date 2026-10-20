@@ -27,8 +27,9 @@ Rate limits (per IP, fixed window): `POST /api/orders` 20/min;
 `POST /api/contact-messages` 10/min; `GET /api/contact-messages/mine` 60/min;
 `GET /api/products*` 120/min;
 `/api/admin/*` 60/min; `POST /api/admin/uploads`
-and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
-`Retry-After` header.
+and `POST /api/profile/photo` 30/min; device-token endpoints
+(`POST`/`DELETE /api/notifications/devices` and the POST remove alias) 60/min.
+Rate-limited responses are `429` with a `Retry-After` header.
 
 ---
 
@@ -44,6 +45,8 @@ and `POST /api/profile/photo` 30/min. Rate-limited responses are `429` with a
 | POST | `/api/orders/:id/cancel` | Bearer (order owner) | Cancel a `PENDING` order (sets `orderStatus: CANCELLED`, never deletes) → full order (§4) |
 | POST | `/api/orders/:id/gcash-details` | Bearer (order owner) | Submit GCash details for manual verification → `{ id, paymentStatus }` (§4) |
 | POST | `/api/orders/:id/payment-proof` | Bearer (order owner) | Upload mandatory GCash proof (multipart `file`, JPEG/PNG/WebP, ≤5 MB) → `201 { id, paymentStatus, paymentProof }`; alias `/gcash-proof` (§4) |
+| POST | `/api/notifications/devices` | Bearer (any signed-in user) | Register/refresh an FCM device token → `201 { id, platform }` (§7) |
+| DELETE | `/api/notifications/devices` | Bearer (token owner) | Remove the caller's token → `{ removed }`; alias `POST /api/notifications/devices/remove` (§7) |
 | POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm COD collection → `{ id, paymentStatus }` (§4) |
 | POST | `/api/admin/orders/:id/payment-proof` | Bearer (admin) | Alias of `/payment` for proof review (§4) |
 | POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Explicitly confirm COD cash collection → `{ id, paymentStatus: "PAID" }` (§4) |
@@ -209,7 +212,8 @@ Full stored order: `id`, `customerId`, `customerSnapshot`, `addressSnapshot`,
 `paymentProofUrl`, `proofUrl`, `gcashProofUrl`,
 `refund` (`{ status, amount, requestedAt, completedAt }` refund facts — see
 "Manual refunds"; `NOT_REFUNDED` unless a refund was recorded),
-`orderStatus`, `createdAt`, `updatedAt`.
+`orderStatus`, `orderStatusLabel` (user-facing label; `OUT_FOR_DELIVERY` is
+returned as `"On the Way"`), `createdAt`, `updatedAt`.
 `paymentProof` is `{ url, publicId, mimeType, size, submittedBy, submittedAt }`;
 only this URL/metadata is stored in Firestore — never image bytes or base64.
 Historical orders are returned **exactly as stored** — prices are never
@@ -223,12 +227,15 @@ customer responses.
 
 ### Status graph (admin only)
 
-`PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; `CANCELLED` reachable
-from every non-terminal state. Re-sending the current status is an
-idempotent no-op; anything else → `400 invalid_status_transition`.
-Moving a COD order to `COMPLETED` also writes `paymentStatus: "PAID"` (cash is
-collected on delivery) and appends a `paymentAudit` entry. GCash payment status
-is never changed by a status transition.
+`PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; delivery orders may also
+go `READY → OUT_FOR_DELIVERY → COMPLETED`, while pickup orders go directly
+`READY → COMPLETED`. `OUT_FOR_DELIVERY` is only reachable from `READY`, and
+`CANCELLED` is reachable from every non-terminal state. Re-sending the current
+status is an idempotent no-op; anything else → `400 invalid_status_transition`.
+`OUT_FOR_DELIVERY` is the internal value; clients should display the
+`orderStatusLabel` field (`"On the Way"`). Status transitions never change
+`paymentStatus`; COD cash collection is recorded only via the explicit
+`/cod-payment` endpoint.
 
 ### Customer order cancellation
 
@@ -251,7 +258,7 @@ the same shape as `GET /api/orders/:id`.
   order, or owned by someone else — administrators are not owners and cancel
   via `POST /api/admin/orders/:id/status` instead, so they also get `404` here);
   `409 order_not_cancellable` (order already `CONFIRMED`/`PREPARING`/`READY`/
-  `COMPLETED`).
+  `OUT_FOR_DELIVERY`/`COMPLETED`).
 - Runs in a Firestore transaction, so a cancellation racing an admin
   confirmation cannot overwrite the confirmed state.
 
@@ -264,9 +271,9 @@ reviews the proof and records the decision here. The submitted name/details do
 not prove payment on their own; only an admin decision marks a GCash order
 `PAID`, and that decision requires proof to have been submitted.
 
-`orderStatus` and `paymentStatus` remain independent for GCash: completing a
-GCash order never marks it paid. For COD, cash is collected on delivery, so
-moving the order to `COMPLETED` marks it `PAID` in the same write (see "COD
+`orderStatus` and `paymentStatus` are always independent: dispatching or
+completing an order never marks it paid, for either GCash or COD. For COD, cash
+collection is recorded explicitly by an admin via `/cod-payment` (see "COD
 collection").
 
 **Payment-status transitions** (`paymentStatus` is independent of the
@@ -281,8 +288,7 @@ fulfilment field `orderStatus`; confirming payment never completes an order):
 | `VERIFYING` | `REJECTED` | admin | rejection |
 | `PAID` | `PAID` | admin | idempotent no-op (writes nothing) |
 | `REJECTED` | `REJECTED` | admin | idempotent no-op (writes nothing) |
-| `PENDING` | `PAID` | admin (`POST …/status` → `COMPLETED`, COD only) | automatic cash settlement on delivery |
-| `PENDING` | `PAID` | admin (`POST …/cod-payment`, COD only) | legacy completed orders only |
+| `PENDING` | `PAID` | admin (`POST …/payment` or `…/cod-payment`, COD only) | explicit cash collection record; order must be `COMPLETED` |
 
 Anything else is rejected: `PAID` can never be overwritten, `REJECTED` can
 only become `PAID` after the customer resubmits (never directly), and an
@@ -373,9 +379,9 @@ order. Image bytes/base64 are never stored in Firestore.
 Explicitly records that cash was collected for a COD order. The optional body
 may be `{ "decision": "PAID" }` or omitted. Only `COD` orders that are already
 `COMPLETED` are accepted, and only `PAID` is a valid target; the order status
-is untouched. Normal orders are settled automatically when they reach
-`COMPLETED`, so this action is for legacy completed orders still stored as
-`PENDING`. Like the GCash decision, it is transactional and idempotent.
+is untouched. Reaching `COMPLETED` never settles COD automatically, so this
+explicit action is the only way to record cash collection. Like the GCash
+decision, it is transactional and idempotent.
 
 ### Manual refunds (no gateway)
 
@@ -636,9 +642,11 @@ store) as a future setup step; no email is sent or claimed today.
 | `orders` | own orders or admin | **denied** — create only via `POST /api/orders`; GCash details only via `POST /api/orders/:id/gcash-details` (owner); status/payment decisions admin-only via the API |
 | `payments` | own or admin | **denied** — backend-managed (PayMongo not yet implemented) |
 | `contactMessages` | **denied** (everyone, admins included) | **denied** — create only via `POST /api/contact-messages` (Admin SDK) |
+| `deviceTokens` | **denied** | **denied** — managed only via `/api/notifications/devices` (Admin SDK) |
+| `notifications` | **denied** | **denied** — backend-only delivery/idempotency records (Admin SDK) |
 
-Only `products` is publicly readable; `users`, `orders`, `payments` and
-`contactMessages` stay private. The Admin SDK (backend) bypasses these rules,
+Only `products` is publicly readable; `users`, `orders`, `payments`,
+`contactMessages`, `deviceTokens` and `notifications` stay private. The Admin SDK (backend) bypasses these rules,
 which is how the API creates orders, products and contact messages. **Deploy
 `firestore.rules` with the Firebase CLI
 against `bistrobuddies-4f179` — this repository does not deploy anything.**
@@ -788,7 +796,83 @@ and are never rewritten by reads or by new uploads.
 
 ---
 
-## 7. Not implemented (out of scope)
+## 7. Push notifications (FCM)
+
+The backend sends Firebase Cloud Messaging notifications for order and payment
+events. No Cloud Functions are used: delivery happens inside the normal API
+request with the Firebase Admin SDK, and notifications are **best-effort** — a
+delivery failure never fails the order/payment operation. Set
+`NOTIFICATIONS_ENABLED=false` to disable sending (default `true`). The same
+Firebase Admin credentials used for Firestore are sufficient; no FCM server key
+is configured separately.
+
+### Device tokens
+
+**POST /api/notifications/devices** (any signed-in user, 60/min/IP):
+
+```jsonc
+// request
+{ "token": "<FCM registration token>", "platform": "android" }
+// platform: "android" | "ios" | "web" | "unknown" (optional, defaults to "unknown")
+// response 201
+{ "id": "<sha256 of token>", "platform": "android" }
+```
+
+- The owning `uid` always comes from the verified Firebase ID token; it is never
+  read from the request body.
+- A user may register multiple devices. Re-registering the same token refreshes
+  it; registering a token that was previously owned by another account moves it
+  to the caller (expected on a shared device).
+- Tokens are stored in the server-only `deviceTokens/{sha256(token)}`
+  collection. The raw token is accepted in requests but is never returned by
+  the API.
+- Errors: `401 unauthorized`; `400 invalid_request` (missing/blank token, token
+  longer than 4096 characters, whitespace, or an unknown platform) with
+  per-field `details`.
+
+**DELETE /api/notifications/devices** (token owner, 60/min/IP), body
+`{ "token": "…" }` → `{ "removed": true|false }`.
+`POST /api/notifications/devices/remove` is an equivalent alias for clients
+that cannot send a DELETE body. Removing a token owned by another user is a
+safe no-op (`removed: false`) and leaves the token untouched.
+
+FCM invalid/expired tokens (`registration-token-not-registered`,
+`invalid-registration-token`, `invalid-argument`) are deleted automatically
+after re-checking that the token still belongs to the same user.
+
+### Events
+
+| Event | Recipients | Trigger | `data.type` |
+| --- | --- | --- | --- |
+| Order status | The order's customer | Genuine admin transition to `CONFIRMED`, `PREPARING`, `READY`, `OUT_FOR_DELIVERY` or `COMPLETED` | `ORDER_STATUS` |
+| New order | Every enabled admin device | A customer creates an order | `ADMIN_NEW_ORDER` |
+| Payment proof submitted | Every enabled admin device | GCash proof upload succeeds | `ADMIN_PAYMENT_PROOF` |
+| Payment decision | The order's customer | Admin records a GCash `PAID`/`REJECTED` decision | `PAYMENT_DECISION` |
+
+`OUT_FOR_DELIVERY` sends title `"On the Way"` and body
+`"Your coffee order is on the way!"`. Status payloads also carry
+`orderId`, `orderStatus` and `orderStatusLabel`; payment payloads carry
+`orderId` and `paymentStatus`. Payloads are intentionally minimal: they never
+include GCash account numbers, proof URLs, or other customers' data. Payment
+status notifications are only sent for GCash decisions; COD collection does not
+send a push.
+
+### Delivery guarantees
+
+Each recipient event is claimed transactionally in the server-only
+`notifications/{sha256(recipientEventKey)}` collection
+(`status: PENDING|SENT|FAILED|SKIPPED`). Per-recipient keys keep admin fan-out
+isolated, and repeated API calls for the same event do not send duplicate
+pushes. If an event cannot be claimed, the send is skipped (fail closed). The
+event record is then marked `SENT`, `FAILED` (with counts/reason) or `SKIPPED`
+(no registered tokens); delivery itself is not automatically retried.
+
+Both `deviceTokens` and `notifications` deny all client reads/writes in
+`firestore.rules`; only the Admin SDK can access them.
+
+---
+
+## 8. Not implemented (out of scope)
 
 - **Firebase Storage** — not used. Permanent image hosting is Cloudinary
   (§6); the remaining local-disk surface is read-only legacy serving of

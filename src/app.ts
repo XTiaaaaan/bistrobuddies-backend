@@ -14,6 +14,7 @@ import { adminProductsRouter } from './routes/admin-products';
 import { adminUploadsRouter } from './routes/admin-uploads';
 import { contactMessagesRouter } from './routes/contact-messages';
 import { healthRouter } from './routes/health';
+import { notificationsRouter } from './routes/notifications';
 import { ordersRouter } from './routes/orders';
 import { productsRouter } from './routes/products';
 import { profileUploadsRouter } from './routes/profile-uploads';
@@ -57,6 +58,7 @@ export function createApp(): Express {
   api.use(healthRouter);
   api.use(productsRouter);
   api.use(ordersRouter);
+  api.use(notificationsRouter);
   api.use(contactMessagesRouter);
   api.use('/admin/products', adminProductsRouter);
   api.use('/admin/uploads', adminUploadsRouter);

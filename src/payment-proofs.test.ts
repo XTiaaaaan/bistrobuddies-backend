@@ -664,30 +664,39 @@ describe('GCash payment proof and payment status correction', () => {
   });
 
   describe('COD and independent payment status', () => {
-    it('marks COD PAID when the order becomes COMPLETED', async () => {
-      const response = await status('cod-pending', 'CONFIRMED');
-      expect(response.status).toBe(200);
-      await status('cod-pending', 'PREPARING');
-      await status('cod-pending', 'READY');
+    it('keeps COD payment independent when the order is dispatched and completed', async () => {
+      expect((await status('cod-pending', 'CONFIRMED')).status).toBe(200);
+      expect((await status('cod-pending', 'PREPARING')).status).toBe(200);
+      expect((await status('cod-pending', 'READY')).status).toBe(200);
+      const dispatched = await status('cod-pending', 'OUT_FOR_DELIVERY');
+      expect(dispatched.status).toBe(200);
+      expect(await dispatched.json()).toEqual({
+        id: 'cod-pending',
+        orderStatus: 'OUT_FOR_DELIVERY',
+      });
+      expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
+
       const completed = await status('cod-pending', 'COMPLETED');
       expect(completed.status).toBe(200);
-      expect(await completed.json()).toMatchObject({
+      expect(await completed.json()).toEqual({
         id: 'cod-pending',
         orderStatus: 'COMPLETED',
-        paymentStatus: 'PAID',
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(stored('cod-pending')['orderStatus']).toBe('COMPLETED');
-      expect(stored('cod-pending')['paymentStatus']).toBe('PAID');
-      const audit = stored('cod-pending')['paymentAudit'] as Array<
-        Record<string, unknown>
-      >;
-      expect(audit[audit.length - 1]).toMatchObject({
-        from: 'PENDING',
-        to: 'PAID',
-        actorUid: 'admin-1',
-        actorRole: 'admin',
-      });
+      // Completing an order never marks its payment PAID.
+      expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
+      expect(stored('cod-pending')['paymentAudit']).toBeUndefined();
+    });
+
+    it('lets pickup orders skip OUT_FOR_DELIVERY', async () => {
+      expect((await status('cod-pending', 'CONFIRMED')).status).toBe(200);
+      expect((await status('cod-pending', 'PREPARING')).status).toBe(200);
+      expect((await status('cod-pending', 'READY')).status).toBe(200);
+      const completed = await status('cod-pending', 'COMPLETED');
+      expect(completed.status).toBe(200);
+      expect(stored('cod-pending')['orderStatus']).toBe('COMPLETED');
+      expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
     });
 
     it('refuses to collect COD before the order is COMPLETED', async () => {

@@ -114,6 +114,12 @@ export interface BackendConfig {
   cloudinaryApiKey: string | null;
   /** Cloudinary API secret (server-side only, never returned to clients). */
   cloudinaryApiSecret: string | null;
+  /**
+   * Whether push notifications are dispatched. Defaults to true; set
+   * `NOTIFICATIONS_ENABLED=0` to disable FCM sends without removing tokens.
+   * Notification failures never affect order/payment operations.
+   */
+  notificationsEnabled: boolean;
 }
 
 export function loadConfig(): BackendConfig {
@@ -154,6 +160,7 @@ export function loadConfig(): BackendConfig {
     cloudinaryApiKey: process.env['CLOUDINARY_API_KEY']?.trim() || null,
     cloudinaryApiSecret:
       process.env['CLOUDINARY_API_SECRET']?.trim() || null,
+    notificationsEnabled: readBoolean('NOTIFICATIONS_ENABLED', true),
   };
 }
 

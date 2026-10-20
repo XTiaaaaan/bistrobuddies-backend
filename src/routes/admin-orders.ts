@@ -12,11 +12,11 @@ import { getAuth, requireAdmin, requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
 import { rateLimit } from '../middleware/rate-limit';
 import {
-  completedCodPaymentPatch,
   confirmCodPayment,
   decideOrderPayment,
   recordRefundAction,
 } from '../services/orders.service';
+import { notifyOrderStatusChanged } from '../services/notifications.service';
 
 export const adminOrdersRouter = Router();
 
@@ -32,9 +32,10 @@ const adminGuard = [
  * Transitions are validated against the allowed status graph; re-sending the
  * current status is treated as an idempotent no-op. The order status is never
  * taken from anywhere but this validated request body, and only after the
- * caller has been verified as an administrator server-side. Moving a COD order
- * to `COMPLETED` marks its payment `PAID` in the same write (cash is collected
- * on delivery); GCash payment status is never changed here.
+ * caller has been verified as an administrator server-side. Fulfilment and
+ * payment are independent: no status transition (including `OUT_FOR_DELIVERY`
+ * or `COMPLETED`) changes `paymentStatus`. COD collection is recorded
+ * explicitly through the separate `/cod-payment` endpoint.
  */
 adminOrdersRouter.post(
   '/orders/:id/status',
@@ -74,27 +75,20 @@ adminOrdersRouter.post(
       );
     }
 
-    const patch: Record<string, unknown> = {
+    await orderRef.update({
       orderStatus: nextStatus,
       updatedAt: FieldValue.serverTimestamp(),
-    };
-    // Cash is collected on delivery, so completing a COD order settles the
-    // payment in the same write. GCash payments stay independent.
-    const codSettlement =
-      nextStatus === 'COMPLETED'
-        ? completedCodPaymentPatch(data, getAuth(req).uid)
-        : null;
-    if (codSettlement) {
-      Object.assign(patch, codSettlement);
-    }
-
-    await orderRef.update(patch);
-
-    res.json({
-      id: orderId,
-      orderStatus: nextStatus,
-      ...(codSettlement ? { paymentStatus: 'PAID' } : {}),
     });
+
+    // Genuine fulfilment change only: the idempotent same-status branch above
+    // returns before this point. Notification failures never fail the update.
+    await notifyOrderStatusChanged(
+      orderId,
+      typeof data['customerId'] === 'string' ? data['customerId'] : '',
+      nextStatus
+    );
+
+    res.json({ id: orderId, orderStatus: nextStatus });
   })
 );
 
