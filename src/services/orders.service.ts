@@ -3,8 +3,11 @@ import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 import { config } from '../config';
 import { ApiError, badRequest, notFound } from '../errors';
 import { requireFirebase } from '../firebase/admin';
+import { deleteFromCloudinary } from '../lib/cloudinary';
+import { saveUploadedImage } from '../lib/image-upload';
 import { CURRENCY, resolvePrice, roundMoney } from '../lib/money';
 import { toIso } from '../lib/serialize';
+import { logger } from '../logger';
 import {
   CreateOrderRequest,
   CreateOrderItemInput,
@@ -241,6 +244,22 @@ export interface PaymentAuditEntry {
   actorRole: 'customer' | 'admin';
 }
 
+/** Customer-submitted GCash payment proof stored on the order. */
+export interface PaymentProofResponse {
+  /** HTTPS Cloudinary URL of the uploaded proof image. */
+  url: string;
+  /** Cloudinary public id (used for best-effort cleanup). */
+  publicId: string;
+  /** Detected image MIME type (JPEG/PNG/WebP). */
+  mimeType: string;
+  /** Uploaded file size in bytes. */
+  size: number;
+  /** UID of the customer who uploaded the proof (from the verified token). */
+  submittedBy: string;
+  /** When the proof was submitted (ISO-8601), or null for legacy data. */
+  submittedAt: string | null;
+}
+
 /**
  * Customer- and admin-visible refund facts on an order. Admin-only notes or
  * audit detail are deliberately excluded — this shape is safe for both.
@@ -277,6 +296,16 @@ export interface OrderResponse {
   paymentStatus: string;
   /** Submitted GCash details, or null when none were submitted yet. */
   gcashDetails: GcashDetailsResponse | null;
+  /** Latest submitted GCash payment proof, or null when none exists. */
+  paymentProof: PaymentProofResponse | null;
+  /** Alias of `paymentProof` using the GCash-specific field name. */
+  gcashProof: PaymentProofResponse | null;
+  /** Convenience copy of the proof URL (`paymentProof.url`), or null. */
+  paymentProofUrl: string | null;
+  /** Alias of `paymentProofUrl` for clients using the shorter name. */
+  proofUrl: string | null;
+  /** Alias of `paymentProofUrl` using the GCash-specific field name. */
+  gcashProofUrl: string | null;
   /** Refund facts (status/amount/timestamps) — safe for customers and admins. */
   refund: RefundInfoResponse;
   /**
@@ -310,6 +339,70 @@ function readGcashDetails(data: Record<string, unknown>): GcashDetailsResponse |
     accountNumber: record['accountNumber'],
     submittedAt: toIso(record['submittedAt']),
   };
+}
+
+/**
+ * Reads the stored GCash payment proof. Supports the canonical nested
+ * `paymentProof` object, the `gcashProof` alias, and the flat
+ * `paymentProofUrl` fields so data written by any version of the API remains
+ * readable. Image bytes/base64 are never stored or returned.
+ */
+function readPaymentProof(
+  data: Record<string, unknown>
+): PaymentProofResponse | null {
+  const nested = data['paymentProof'] ?? data['gcashProof'];
+  if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) {
+    const record = nested as Record<string, unknown>;
+    const url =
+      typeof record['url'] === 'string'
+        ? record['url']
+        : typeof record['imageUrl'] === 'string'
+          ? record['imageUrl']
+          : '';
+    if (url !== '') {
+      return {
+        url,
+        publicId:
+          typeof record['publicId'] === 'string' ? record['publicId'] : '',
+        mimeType:
+          typeof record['mimeType'] === 'string' ? record['mimeType'] : '',
+        size:
+          typeof record['size'] === 'number' && Number.isFinite(record['size'])
+            ? record['size']
+            : 0,
+        submittedBy:
+          typeof record['submittedBy'] === 'string'
+            ? record['submittedBy']
+            : '',
+        submittedAt: toIso(record['submittedAt']),
+      };
+    }
+  }
+
+  const flatUrl =
+    typeof data['paymentProofUrl'] === 'string'
+      ? data['paymentProofUrl']
+      : typeof data['gcashProofUrl'] === 'string'
+        ? data['gcashProofUrl']
+        : data['proofUrl'];
+  if (typeof flatUrl === 'string' && flatUrl !== '') {
+    return {
+      url: flatUrl,
+      publicId:
+        typeof data['paymentProofPublicId'] === 'string'
+          ? data['paymentProofPublicId']
+          : '',
+      mimeType: '',
+      size: 0,
+      submittedBy:
+        typeof data['paymentProofSubmittedBy'] === 'string'
+          ? data['paymentProofSubmittedBy']
+          : '',
+      submittedAt: toIso(data['paymentProofSubmittedAt']),
+    };
+  }
+
+  return null;
 }
 
 function readPaymentDecision(
@@ -462,6 +555,7 @@ export function serializeOrder(
   data: Record<string, unknown>,
   options?: { isAdmin?: boolean }
 ): OrderResponse {
+  const paymentProof = readPaymentProof(data);
   const response: OrderResponse = {
     id: orderId,
     customerId:
@@ -487,6 +581,11 @@ export function serializeOrder(
         ? data['paymentStatus']
         : 'PENDING',
     gcashDetails: readGcashDetails(data),
+    paymentProof,
+    gcashProof: paymentProof,
+    paymentProofUrl: paymentProof?.url ?? null,
+    proofUrl: paymentProof?.url ?? null,
+    gcashProofUrl: paymentProof?.url ?? null,
     refund: readRefund(data),
     orderStatus:
       typeof data['orderStatus'] === 'string'
@@ -697,27 +796,178 @@ export async function submitGcashDetails(
   });
 }
 
+export interface PaymentProofSubmissionResult {
+  id: string;
+  paymentStatus: PaymentStatus;
+  paymentProof: {
+    url: string;
+    publicId: string;
+    mimeType: string;
+    size: number;
+    submittedBy: string;
+    submittedAt: string;
+  };
+}
+
+function assertProofUploadAllowed(
+  data: Record<string, unknown>,
+  customerId: string
+): void {
+  if (data['customerId'] !== customerId) {
+    throw notFound('order_not_found', 'This order no longer exists.');
+  }
+  if (data['paymentMethod'] !== 'GCASH') {
+    throw new ApiError(
+      409,
+      'invalid_payment_method',
+      'Only GCash orders can upload payment proof.'
+    );
+  }
+  if (readStoredPaymentStatus(data) === 'PAID') {
+    throw new ApiError(
+      409,
+      'payment_already_confirmed',
+      'This payment has already been confirmed and its proof cannot be changed.'
+    );
+  }
+}
+
+/**
+ * Stores a customer-submitted GCash payment proof image on an order.
+ *
+ * The caller must own the order (verified token uid), the order must use
+ * GCASH, and the payment must not already be PAID. Proof may be submitted
+ * from `PENDING`, replaced while `VERIFYING`, or replaced after a `REJECTED`
+ * decision; a successful upload moves the independent `paymentStatus` to
+ * `VERIFYING` so an administrator can review it. It never marks the payment
+ * PAID — only the admin decision endpoint may do that.
+ *
+ * The image is validated by `saveUploadedImage` (magic bytes, JPEG/PNG/WebP,
+ * configured size cap) and stored in Cloudinary; only its HTTPS URL and
+ * metadata are written to Firestore. If the upload succeeds but the order
+ * write fails, the newly uploaded Cloudinary asset is deleted on a
+ * best-effort basis.
+ */
+export async function submitGcashProof(
+  user: { uid: string },
+  orderId: string,
+  file: Express.Multer.File | undefined
+): Promise<PaymentProofSubmissionResult> {
+  const { db } = requireFirebase();
+  const orderRef = db.doc(`orders/${orderId}`);
+
+  // Reject missing/foreign/COD/PAID orders before uploading anything.
+  const preflight = await orderRef.get();
+  if (!preflight.exists) {
+    throw notFound('order_not_found', 'This order no longer exists.');
+  }
+  assertProofUploadAllowed(
+    (preflight.data() ?? {}) as Record<string, unknown>,
+    user.uid
+  );
+
+  const saved = await saveUploadedImage(file);
+  const now = new Date();
+
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snapshot = await tx.get(orderRef);
+      if (!snapshot.exists) {
+        throw notFound('order_not_found', 'This order no longer exists.');
+      }
+      const data = (snapshot.data() ?? {}) as Record<string, unknown>;
+      // Re-check inside the transaction in case the order changed while the
+      // image was uploading (e.g. an admin confirmed it or it was cancelled).
+      assertProofUploadAllowed(data, user.uid);
+
+      const current = readStoredPaymentStatus(data);
+      const audit = readPaymentAudit(data);
+      if (current !== 'VERIFYING') {
+        audit.push({
+          from: current,
+          to: 'VERIFYING',
+          actorUid: user.uid,
+          actorRole: 'customer',
+        });
+      }
+
+      const storedProof = {
+        url: saved.publicUrl,
+        publicId: saved.publicId,
+        mimeType: saved.mimeType,
+        size: saved.size,
+        submittedBy: user.uid,
+        submittedAt: FieldValue.serverTimestamp(),
+      };
+
+      tx.update(orderRef, {
+        // Canonical nested record plus aliases read by older/newer clients.
+        paymentProof: storedProof,
+        gcashProof: storedProof,
+        paymentProofUrl: saved.publicUrl,
+        proofUrl: saved.publicUrl,
+        gcashProofUrl: saved.publicUrl,
+        paymentProofPublicId: saved.publicId,
+        paymentProofSubmittedBy: user.uid,
+        paymentProofSubmittedAt: FieldValue.serverTimestamp(),
+        paymentStatus: 'VERIFYING',
+        paymentAudit: audit,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return {
+        id: orderId,
+        paymentStatus: 'VERIFYING' as PaymentStatus,
+        paymentProof: {
+          url: saved.publicUrl,
+          publicId: saved.publicId,
+          mimeType: saved.mimeType,
+          size: saved.size,
+          submittedBy: user.uid,
+          submittedAt: now.toISOString(),
+        },
+      };
+    });
+  } catch (error) {
+    const cleaned = await deleteFromCloudinary(saved.publicId);
+    logger.warn('Orphaned GCash payment proof upload cleanup attempted.', {
+      orderId,
+      publicId: saved.publicId,
+      cleaned,
+    });
+    throw error;
+  }
+}
+
 export interface PaymentDecisionResult {
   id: string;
   paymentStatus: PaymentStatus;
 }
 
+type PaymentDecisionScope = 'GCASH' | 'COD' | 'ANY';
+
 /**
- * Records an admin decision on a GCash payment.
+ * Shared admin payment-decision transaction.
  *
- * The order must use GCash and currently be `VERIFYING` with submitted
- * details. Repeating the current decision (`PAID` → `PAID`,
- * `REJECTED` → `REJECTED`) is an idempotent no-op that writes nothing.
- * A confirmed (`PAID`) payment can never be overwritten, and a `REJECTED`
- * payment can only become `PAID` after the customer resubmits details (which
- * returns the order to `VERIFYING`) — never directly. The fulfilment field
- * `orderStatus` is never touched here. Runs in a Firestore transaction so
- * concurrent admin decisions cannot create inconsistent states.
+ * `scope` restricts which payment method the caller is allowed to act on:
+ * the GCash endpoint cannot touch COD orders, the COD collection endpoint
+ * cannot touch GCash orders, and the general admin payment endpoint accepts
+ * either (but applies the correct rules for each).
+ *
+ * GCash rules: the order must be `VERIFYING` with submitted details AND
+ * submitted proof before it can become `PAID`. Repeating the current decision
+ * is an idempotent no-op. `PAID` can never be overwritten and `REJECTED` can
+ * only become `PAID` after the customer resubmits.
+ *
+ * COD rules: only an explicit `PAID` decision (cash actually collected) is
+ * accepted. Completing an order never changes its payment status on its own.
+ * The fulfilment field `orderStatus` is never touched here.
  */
-export async function decideGcashPayment(
+async function decidePayment(
   admin: { uid: string },
   orderId: string,
-  decision: PaymentDecision
+  decision: PaymentDecision,
+  scope: PaymentDecisionScope
 ): Promise<PaymentDecisionResult> {
   const { db } = requireFirebase();
   const orderRef = db.doc(`orders/${orderId}`);
@@ -728,13 +978,67 @@ export async function decideGcashPayment(
       throw notFound('order_not_found', 'This order no longer exists.');
     }
     const data = (snapshot.data() ?? {}) as Record<string, unknown>;
-    if (data['paymentMethod'] !== 'GCASH') {
+    const method = data['paymentMethod'];
+
+    if (scope !== 'ANY' && method !== scope) {
       throw new ApiError(
         409,
         'invalid_payment_method',
-        'Only GCash orders can receive a GCash payment decision.'
+        scope === 'COD'
+          ? 'Only cash-on-delivery orders can be marked as collected.'
+          : 'Only GCash orders can receive a GCash payment decision.'
       );
     }
+    if (method === 'COD') {
+      if (decision !== 'PAID') {
+        throw new ApiError(
+          409,
+          'invalid_payment_method',
+          'Cash-on-delivery payments can only be marked as collected (PAID).'
+        );
+      }
+      const current = readStoredPaymentStatus(data);
+      if (current === 'PAID') {
+        return { id: orderId, paymentStatus: current };
+      }
+      if (current !== 'PENDING') {
+        throw new ApiError(
+          409,
+          'invalid_payment_transition',
+          'This cash-on-delivery payment cannot be marked as collected from its current state.'
+        );
+      }
+
+      const audit = readPaymentAudit(data);
+      audit.push({
+        from: current,
+        to: 'PAID',
+        actorUid: admin.uid,
+        actorRole: 'admin',
+      });
+
+      tx.update(orderRef, {
+        paymentStatus: 'PAID',
+        paymentDecision: {
+          decision: 'PAID',
+          decidedBy: admin.uid,
+          decidedAt: FieldValue.serverTimestamp(),
+        },
+        paymentAudit: audit,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return { id: orderId, paymentStatus: 'PAID' as PaymentStatus };
+    }
+
+    if (method !== 'GCASH') {
+      throw new ApiError(
+        409,
+        'invalid_payment_method',
+        'Only GCash or COD orders can receive a payment decision.'
+      );
+    }
+
     const current = readStoredPaymentStatus(data);
 
     if (current === decision) {
@@ -762,6 +1066,13 @@ export async function decideGcashPayment(
         'The customer must submit GCash payment details before an admin can decide.'
       );
     }
+    if (decision === 'PAID' && readPaymentProof(data) === null) {
+      throw new ApiError(
+        409,
+        'payment_proof_required',
+        'The customer must upload GCash payment proof before the payment can be confirmed.'
+      );
+    }
 
     const audit = readPaymentAudit(data);
     audit.push({
@@ -784,6 +1095,43 @@ export async function decideGcashPayment(
 
     return { id: orderId, paymentStatus: decision };
   });
+}
+
+/** Records an admin PAID/REJECTED decision on a GCash payment (GCash only). */
+export function decideGcashPayment(
+  admin: { uid: string },
+  orderId: string,
+  decision: PaymentDecision
+): Promise<PaymentDecisionResult> {
+  return decidePayment(admin, orderId, decision, 'GCASH');
+}
+
+/**
+ * Records an admin payment decision without pre-selecting the method: GCash
+ * orders follow the verification workflow, COD orders may only be marked as
+ * collected (`PAID`).
+ */
+export function decideOrderPayment(
+  admin: { uid: string },
+  orderId: string,
+  decision: PaymentDecision
+): Promise<PaymentDecisionResult> {
+  return decidePayment(admin, orderId, decision, 'ANY');
+}
+
+/**
+ * Explicitly confirms that cash was collected for a COD order.
+ *
+ * This is the authorized COD action that keeps payment status independent of
+ * fulfilment: moving an order to `COMPLETED` never marks it PAID, but an
+ * administrator can record the actual collection here. Repeating it is an
+ * idempotent no-op and a confirmed payment can never be overwritten.
+ */
+export function confirmCodPayment(
+  admin: { uid: string },
+  orderId: string
+): Promise<PaymentDecisionResult> {
+  return decidePayment(admin, orderId, 'PAID', 'COD');
 }
 
 /**

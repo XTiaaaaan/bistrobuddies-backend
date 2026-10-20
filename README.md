@@ -58,6 +58,7 @@ Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 | GET | `/api/orders/:id` | Bearer (owner/admin) | Others get 404 (no order id probing). 120 req/min/IP |
 | POST | `/api/orders/:id/cancel` | Bearer (owner) | Cancels a `PENDING` order (`orderStatus: CANCELLED`, never deletes). 20 req/min/IP |
 | POST | `/api/orders/:id/gcash-details` | Bearer (owner) | Submits GCash name/number for manual verification → `{ id, paymentStatus }`. 20 req/min/IP |
+| POST | `/api/orders/:id/payment-proof` | Bearer (owner) | Uploads mandatory GCash proof (multipart `file`, JPEG/PNG/WebP, ≤5 MB) to Cloudinary → `{ id, paymentStatus: "VERIFYING", paymentProof }`. Alias: `/gcash-proof`. 20 req/min/IP |
 | POST | `/api/contact-messages` | Bearer (customer) | Stores a "Contact Us" submission in Firestore → `{ id, status }`. 10 req/min/IP |
 | GET | `/api/contact-messages/mine` | Bearer (customer) | The caller's own messages, newest first. 60 req/min/IP |
 | POST | `/api/admin/products` | Bearer (admin) | Creates a product. 60 req/min/IP |
@@ -67,7 +68,9 @@ Full contract for the mobile and admin clients: **`docs/API_CONTRACT.md`**.
 | POST | `/api/profile/photo` | Bearer (customer) | Stores the caller's profile picture in Cloudinary. 30 req/min/IP |
 | GET | `/uploads/:file` | — (public read) | Serves **legacy** local images read-only (new uploads go to Cloudinary) |
 | POST | `/api/admin/orders/:id/status` | Bearer (admin) | Validated status transition (idempotent on same status) |
-| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment → `{ id, paymentStatus }` |
+| POST | `/api/admin/orders/:id/payment` | Bearer (admin) | Confirm/reject a GCash payment (proof required for PAID) or confirm COD collection → `{ id, paymentStatus }` |
+| POST | `/api/admin/orders/:id/payment-proof` | Bearer (admin) | Alias of `/payment` for reviewing submitted proof |
+| POST | `/api/admin/orders/:id/cod-payment` | Bearer (admin) | Explicitly confirm COD cash collection → `{ id, paymentStatus: "PAID" }` |
 | POST | `/api/admin/orders/:id/refund` | Bearer (admin) | Record a manual refund on a cancelled paid order → full order incl. `refund` |
 | GET | `/api/admin/contact-messages` | Bearer (admin) | Lists customer "Contact Us" messages, newest first (`?status=NEW\|READ\|RESOLVED`, `?page`, `?pageSize`). 60 req/min/IP |
 | PATCH | `/api/admin/contact-messages/:id/status` | Bearer (admin) | Sets `status` to `READ` or `RESOLVED` → `{ id, status }` |
@@ -77,6 +80,26 @@ Every path also works without the `/api` prefix (the router is mounted at both
 `/api` and `/`); **use the `/api/...` paths**. All responses use
 `{ "error": { "code", "message", "details?" } }` on failure. Full request and
 response shapes: **`docs/API_CONTRACT.md`**.
+
+### Payment status and GCash proof
+
+`orderStatus` (fulfilment) and `paymentStatus` (money) are independent. Moving
+an order to `COMPLETED` never marks it paid: COD is confirmed through the
+explicit admin action `POST /api/admin/orders/:id/cod-payment` (or the same
+`/payment` endpoint with `{ "decision": "PAID" }`), and GCash becomes `PAID`
+only when an administrator confirms it after reviewing the customer's submitted
+details **and proof**.
+
+The mandatory GCash proof is uploaded by the order owner via
+`POST /api/orders/:id/payment-proof` (alias `/gcash-proof`) as
+`multipart/form-data` with one `file` field. JPEG/PNG/WebP are detected from
+magic bytes, the 5 MB limit is enforced, and the image is stored in Cloudinary
+(never in Firestore). Only the HTTPS URL and metadata are written to the order;
+the payment moves to `VERIFYING` and can be replaced while verifying or after a
+rejection. Proof cannot be changed once the payment is `PAID`, and a successful
+upload whose Firestore write fails has its Cloudinary asset cleaned up
+best-effort. Administrators see the proof URL in the normal order data and
+approve/reject it through the admin payment endpoint (admin role required).
 
 ### Product schema and currency
 

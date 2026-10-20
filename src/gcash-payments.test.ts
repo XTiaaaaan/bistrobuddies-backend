@@ -208,8 +208,17 @@ describe('manual GCash verification', () => {
         },
       ],
     ]);
+    const proof = {
+      url: 'https://res.cloudinary.com/test-cloud/image/upload/v1/bistrobuddies/proof.png',
+      publicId: 'bistrobuddies/proof',
+      mimeType: 'image/png',
+      size: 128,
+      submittedBy: 'cust-1',
+      submittedAt: '2026-10-16T00:00:00.000Z',
+    };
+
     state.store.orders = new Map([
-      ['g-pending', gcashOrder({ id: 'g-pending' })],
+      ['g-pending', gcashOrder({ id: 'g-pending', paymentProof: proof })],
       [
         'g-verifying',
         gcashOrder({
@@ -221,6 +230,7 @@ describe('manual GCash verification', () => {
             submittedBy: 'cust-1',
             submittedAt: '2026-10-16T00:00:00.000Z',
           },
+          paymentProof: proof,
         }),
       ],
       ['g-other', gcashOrder({ id: 'g-other', customerId: 'cust-2' })],
@@ -289,6 +299,7 @@ describe('manual GCash verification', () => {
             submittedBy: 'cust-1',
             submittedAt: '2026-10-16T00:00:00.000Z',
           },
+          paymentProof: proof,
         }),
       ],
     ]);
@@ -607,8 +618,14 @@ describe('manual GCash verification', () => {
         expect(response.status).toBe(400);
       }
 
+      // COD has its own explicit collection action: PAID is accepted, while
+      // REJECTED is not meaningful for cash on delivery.
       const cod = await decide('c-cod', 'valid-admin', { decision: 'PAID' });
-      expect(cod.status).toBe(409);
+      expect(cod.status).toBe(200);
+      const codRejected = await decide('c-cod', 'valid-admin', {
+        decision: 'REJECTED',
+      });
+      expect(codRejected.status).toBe(409);
 
       const missing = await decide('missing', 'valid-admin', { decision: 'PAID' });
       expect(missing.status).toBe(404);
