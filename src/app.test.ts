@@ -84,6 +84,27 @@ const state = vi.hoisted(() => {
               : [],
         }),
       }),
+      runTransaction: async (
+        fn: (tx: {
+          get: (ref: unknown) => Promise<{ exists: boolean; data: () => unknown }>;
+          update: (ref: unknown, patch: Record<string, unknown>) => Promise<void>;
+          set: (ref: unknown, payload: Record<string, unknown>) => Promise<void>;
+        }) => Promise<unknown>
+      ) => {
+        const tx = {
+          get: (ref: unknown) =>
+            (ref as { get: () => Promise<{ exists: boolean; data: () => unknown }> }).get(),
+          update: (ref: unknown, patch: Record<string, unknown>) =>
+            (ref as { update: (patch: Record<string, unknown>) => Promise<void> }).update(
+              patch
+            ),
+          set: (ref: unknown, payload: Record<string, unknown>) =>
+            (ref as { set: (payload: Record<string, unknown>) => Promise<void> }).set(
+              payload
+            ),
+        };
+        return fn(tx);
+      },
     };
   }
 
