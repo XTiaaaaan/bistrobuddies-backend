@@ -50,24 +50,24 @@ export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   PREPARING: 'Preparing',
   READY: 'Ready',
   OUT_FOR_DELIVERY: 'On the Way',
-  COMPLETED: 'Completed',
+  COMPLETED: 'Delivered',
   CANCELLED: 'Cancelled',
 };
 
 /**
  * Allowed order status transitions (server-enforced).
  *
- * Delivery orders follow `CONFIRMED -> PREPARING -> READY ->
- * OUT_FOR_DELIVERY -> COMPLETED`. Pickup orders skip the delivery hop and go
- * `READY -> COMPLETED`; both transitions are allowed so the flow never forces
- * a pickup order to be marked out for delivery. `OUT_FOR_DELIVERY` is only
- * reachable from `READY`, so an order cannot be dispatched before it is ready.
+ * Every order is delivered and follows `CONFIRMED -> PREPARING -> READY ->
+ * OUT_FOR_DELIVERY -> COMPLETED` (displayed as Confirmed → Preparing → Ready →
+ * On the Way → Delivered). `OUT_FOR_DELIVERY` is only reachable from `READY`,
+ * and `COMPLETED` is only reachable from `OUT_FOR_DELIVERY`, so an order can
+ * never be marked delivered before it is on the way.
  */
 export const ORDER_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   PENDING: ['CONFIRMED', 'CANCELLED'],
   CONFIRMED: ['PREPARING', 'CANCELLED'],
   PREPARING: ['READY', 'CANCELLED'],
-  READY: ['OUT_FOR_DELIVERY', 'COMPLETED', 'CANCELLED'],
+  READY: ['OUT_FOR_DELIVERY', 'CANCELLED'],
   OUT_FOR_DELIVERY: ['COMPLETED', 'CANCELLED'],
   COMPLETED: [],
   CANCELLED: [],
@@ -794,9 +794,11 @@ export function readContactMessageId(raw: string): string {
  * - `REJECTED` — an admin rejected the payment; the customer may resubmit,
  *   which moves the order back to `VERIFYING`.
  *
- * COD orders stay `PENDING` until an admin explicitly records cash collection;
- * completing an order never changes payment. Confirming payment never changes
- * the separate fulfilment field `orderStatus`.
+ * COD orders stay `PENDING` until the order reaches `COMPLETED` (delivery),
+ * at which point the successful cash collection is recorded as `PAID` by the
+ * backend. GCash orders are only ever marked `PAID` by an admin decision.
+ * Payment status and the separate fulfilment field `orderStatus` stay
+ * independent.
  */
 export type PaymentStatus = 'PENDING' | 'VERIFYING' | 'PAID' | 'REJECTED';
 

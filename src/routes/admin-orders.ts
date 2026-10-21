@@ -26,16 +26,66 @@ const adminGuard = [
   requireAdmin,
 ];
 
+type PaymentAuditRecord = {
+  from: string;
+  to: string;
+  actorUid: string;
+  actorRole: 'customer' | 'admin';
+};
+
+const PAYMENT_STATUSES = new Set(['PENDING', 'VERIFYING', 'PAID', 'REJECTED']);
+
+function storedPaymentStatus(data: Record<string, unknown>): string {
+  const raw = data['paymentStatus'];
+  return typeof raw === 'string' && PAYMENT_STATUSES.has(raw)
+    ? raw
+    : 'PENDING';
+}
+
+/** Keeps the existing append-only audit entries exactly as they were stored. */
+function storedPaymentAudit(data: Record<string, unknown>): PaymentAuditRecord[] {
+  const raw = data['paymentAudit'];
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const entries: PaymentAuditRecord[] = [];
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record['from'] === 'string' &&
+      typeof record['to'] === 'string' &&
+      typeof record['actorUid'] === 'string' &&
+      (record['actorRole'] === 'customer' || record['actorRole'] === 'admin')
+    ) {
+      entries.push({
+        from: record['from'],
+        to: record['to'],
+        actorUid: record['actorUid'],
+        actorRole: record['actorRole'],
+      });
+    }
+  }
+  return entries;
+}
+
 /**
  * POST /api/admin/orders/:id/status — transition an order's status (admin only).
  *
  * Transitions are validated against the allowed status graph; re-sending the
  * current status is treated as an idempotent no-op. The order status is never
  * taken from anywhere but this validated request body, and only after the
- * caller has been verified as an administrator server-side. Fulfilment and
- * payment are independent: no status transition (including `OUT_FOR_DELIVERY`
- * or `COMPLETED`) changes `paymentStatus`. COD collection is recorded
- * explicitly through the separate `/cod-payment` endpoint.
+ * caller has been verified as an administrator server-side.
+ *
+ * Fulfilment and payment stay separate fields, but a COD order reaching its
+ * final delivered state (`COMPLETED`) records the successful cash collection
+ * as `PAID` in the same transaction. GCash orders are never marked PAID by a
+ * status change — they still require an authorized admin payment decision.
+ * Cancelling an order never changes payment. Existing audit history and the
+ * existing payment decision/timestamp are preserved; the automatic COD
+ * settlement is skipped when the payment is already PAID.
  */
 adminOrdersRouter.post(
   '/orders/:id/status',
@@ -47,48 +97,91 @@ adminOrdersRouter.post(
     }
 
     const nextStatus = validateOrderStatus(req.body);
+    const admin = getAuth(req);
     const { db } = requireFirebase();
 
     const orderRef = db.doc(`orders/${orderId}`);
-    const snapshot = await orderRef.get();
-    if (!snapshot.exists) {
-      throw notFound('order_not_found', 'This order no longer exists.');
-    }
+    const result = await db.runTransaction(async (tx) => {
+      const snapshot = await tx.get(orderRef);
+      if (!snapshot.exists) {
+        throw notFound('order_not_found', 'This order no longer exists.');
+      }
 
-    const data = snapshot.data() ?? {};
-    const currentStatus = data['orderStatus'];
-    if (currentStatus === nextStatus) {
-      // Idempotent: repeating the current status is a successful no-op.
-      res.json({ id: orderId, orderStatus: currentStatus });
-      return;
-    }
+      const data = (snapshot.data() ?? {}) as Record<string, unknown>;
+      const currentStatus = data['orderStatus'];
+      if (currentStatus === nextStatus) {
+        // Idempotent: repeating the current status is a successful no-op.
+        return {
+          id: orderId,
+          orderStatus: String(currentStatus),
+          changed: false,
+          customerId: '',
+        };
+      }
 
-    const allowed = allowedNextStatuses(
-      currentStatus as Parameters<typeof allowedNextStatuses>[0]
-    );
-    if (!allowed.includes(nextStatus)) {
-      throw new ApiError(
-        400,
-        'invalid_status_transition',
-        `Cannot change order status from ${String(currentStatus)} to ${nextStatus}.`,
-        { current: currentStatus, allowed }
+      const allowed = allowedNextStatuses(
+        currentStatus as Parameters<typeof allowedNextStatuses>[0]
       );
-    }
+      if (!allowed.includes(nextStatus)) {
+        throw new ApiError(
+          400,
+          'invalid_status_transition',
+          `Cannot change order status from ${String(currentStatus)} to ${nextStatus}.`,
+          { current: currentStatus, allowed }
+        );
+      }
 
-    await orderRef.update({
-      orderStatus: nextStatus,
-      updatedAt: FieldValue.serverTimestamp(),
+      const patch: Record<string, unknown> = {
+        orderStatus: nextStatus,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      // A successful COD delivery means the cash was collected. Only the COD
+      // method is settled here, and only when it is not already PAID, so a
+      // repeated completion can never duplicate the audit entry or rewrite an
+      // existing decision/timestamp.
+      if (nextStatus === 'COMPLETED' && data['paymentMethod'] === 'COD') {
+        const currentPayment = storedPaymentStatus(data);
+        if (currentPayment !== 'PAID') {
+          patch['paymentStatus'] = 'PAID';
+          patch['paymentDecision'] = {
+            decision: 'PAID',
+            decidedBy: admin.uid,
+            decidedAt: FieldValue.serverTimestamp(),
+          };
+          patch['paymentAudit'] = [
+            ...storedPaymentAudit(data),
+            {
+              from: currentPayment,
+              to: 'PAID',
+              actorUid: admin.uid,
+              actorRole: 'admin',
+            },
+          ];
+        }
+      }
+
+      tx.update(orderRef, patch);
+      return {
+        id: orderId,
+        orderStatus: nextStatus,
+        changed: true,
+        customerId:
+          typeof data['customerId'] === 'string' ? data['customerId'] : '',
+      };
     });
 
     // Genuine fulfilment change only: the idempotent same-status branch above
     // returns before this point. Notification failures never fail the update.
-    await notifyOrderStatusChanged(
-      orderId,
-      typeof data['customerId'] === 'string' ? data['customerId'] : '',
-      nextStatus
-    );
+    if (result.changed) {
+      await notifyOrderStatusChanged(
+        orderId,
+        result.customerId,
+        nextStatus
+      );
+    }
 
-    res.json({ id: orderId, orderStatus: nextStatus });
+    res.json({ id: orderId, orderStatus: result.orderStatus });
   })
 );
 
@@ -102,8 +195,9 @@ adminOrdersRouter.post(
  *   decision is an idempotent no-op; a confirmed (PAID) payment can never be
  *   overwritten, and REJECTED can only become PAID after the customer
  *   resubmits proof/details.
- * - COD: only `PAID` is accepted, recorded by the admin when cash was
- *   actually collected. Completing an order never marks COD paid by itself.
+ * - COD: only `PAID` is accepted. A COD order is normally settled
+ *   automatically when it reaches `COMPLETED`; this endpoint remains the
+ *   idempotent explicit confirmation for an already-completed order.
  *
  * Recording a decision never changes `orderStatus`.
  */

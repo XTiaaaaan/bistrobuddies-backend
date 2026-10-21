@@ -206,15 +206,19 @@ describe('OUT_FOR_DELIVERY status model', () => {
     expect(orderStatusLabel('OUT_FOR_DELIVERY')).toBe('On the Way');
   });
 
-  it('supports the delivery path and the pickup skip path', () => {
+  it('supports the single delivery workflow path', () => {
     expect(allowedNextStatuses('CONFIRMED')).toContain('PREPARING');
     expect(allowedNextStatuses('PREPARING')).toContain('READY');
     expect(allowedNextStatuses('READY')).toContain('OUT_FOR_DELIVERY');
+    expect(allowedNextStatuses('READY')).not.toContain('COMPLETED');
     expect(allowedNextStatuses('OUT_FOR_DELIVERY')).toContain('COMPLETED');
-    // Pickup orders may complete directly from READY.
-    expect(allowedNextStatuses('READY')).toContain('COMPLETED');
     expect(allowedNextStatuses('COMPLETED')).toEqual([]);
     expect(allowedNextStatuses('CANCELLED')).toEqual([]);
+  });
+
+  it('labels COMPLETED as Delivered for the customer-facing workflow', () => {
+    expect(ORDER_STATUS_LABELS.COMPLETED).toBe('Delivered');
+    expect(orderStatusLabel('COMPLETED')).toBe('Delivered');
   });
 
   it('never dispatches an order that is not READY yet', () => {

@@ -978,11 +978,11 @@ type PaymentDecisionScope = 'GCASH' | 'COD' | 'ANY';
  * is an idempotent no-op. `PAID` can never be overwritten and `REJECTED` can
  * only become `PAID` after the customer resubmits.
  *
- * COD rules: only an explicit `PAID` decision (cash actually collected) is
- * accepted, and only once the order is `COMPLETED` (cash is collected on
- * delivery). Completing an order never settles payment automatically; the
- * admin records collection separately. The fulfilment field `orderStatus` is
- * never touched here.
+ * COD rules: only a `PAID` decision (cash actually collected) is accepted,
+ * and only once the order is `COMPLETED` (cash is collected on delivery).
+ * The admin status endpoint settles COD automatically on delivery; this path
+ * stays as the idempotent explicit confirmation for completed COD orders.
+ * The fulfilment field `orderStatus` is never touched here.
  */
 async function decidePayment(
   admin: { uid: string },
@@ -1176,10 +1176,10 @@ export function decideOrderPayment(
 /**
  * Explicitly confirms that cash was collected for a COD order.
  *
- * Fulfilment and payment are independent: reaching `COMPLETED` never changes
- * `paymentStatus`. The admin records collection through this action once cash
- * was actually received. It requires `orderStatus === 'COMPLETED'`, is an
- * idempotent no-op once paid, and a confirmed payment can never be overwritten.
+ * Reaching `COMPLETED` already settles COD as `PAID` automatically, so this
+ * action is an idempotent confirmation for completed orders. It requires
+ * `orderStatus === 'COMPLETED'`, is an idempotent no-op once paid, and a
+ * confirmed payment can never be overwritten.
  */
 export function confirmCodPayment(
   admin: { uid: string },

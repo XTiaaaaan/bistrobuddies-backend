@@ -340,6 +340,30 @@ describe('GCash payment proof and payment status correction', () => {
           paymentStatus: 'PAID',
         }),
       ],
+      [
+        'cod-existing-audit',
+        order('cod-existing-audit', {
+          paymentMethod: 'COD',
+          orderStatus: 'OUT_FOR_DELIVERY',
+          paymentAudit: [
+            {
+              from: 'PENDING',
+              to: 'VERIFYING',
+              actorUid: 'cust-1',
+              actorRole: 'customer',
+            },
+          ],
+        }),
+      ],
+      [
+        'g-on-way',
+        order('g-on-way', {
+          orderStatus: 'OUT_FOR_DELIVERY',
+          paymentStatus: 'VERIFYING',
+          gcashDetails: GCASH_DETAILS,
+          paymentProof: PROOF,
+        }),
+      ],
     ]);
     state.store.writes = 0;
     state.store.failOrderUpdate = false;
@@ -664,7 +688,7 @@ describe('GCash payment proof and payment status correction', () => {
   });
 
   describe('COD and independent payment status', () => {
-    it('keeps COD payment independent when the order is dispatched and completed', async () => {
+    it('keeps COD PENDING before delivery and marks it PAID on COMPLETED', async () => {
       expect((await status('cod-pending', 'CONFIRMED')).status).toBe(200);
       expect((await status('cod-pending', 'PREPARING')).status).toBe(200);
       expect((await status('cod-pending', 'READY')).status).toBe(200);
@@ -684,19 +708,85 @@ describe('GCash payment proof and payment status correction', () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(stored('cod-pending')['orderStatus']).toBe('COMPLETED');
-      // Completing an order never marks its payment PAID.
-      expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
-      expect(stored('cod-pending')['paymentAudit']).toBeUndefined();
+      expect(stored('cod-pending')['paymentStatus']).toBe('PAID');
+      const audit = stored('cod-pending')['paymentAudit'] as Array<
+        Record<string, unknown>
+      >;
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({
+        from: 'PENDING',
+        to: 'PAID',
+        actorUid: 'admin-1',
+        actorRole: 'admin',
+      });
+      const decision = stored('cod-pending')['paymentDecision'] as Record<
+        string,
+        unknown
+      >;
+      expect(decision['decision']).toBe('PAID');
+      expect(decision['decidedBy']).toBe('admin-1');
     });
 
-    it('lets pickup orders skip OUT_FOR_DELIVERY', async () => {
+    it('never duplicates the COD audit entry or rewrites payment timestamps', async () => {
+      expect((await status('cod-existing-audit', 'COMPLETED')).status).toBe(200);
+      const firstAudit = stored('cod-existing-audit')['paymentAudit'] as Array<
+        Record<string, unknown>
+      >;
+      const firstDecision = stored('cod-existing-audit')[
+        'paymentDecision'
+      ] as Record<string, unknown>;
+      expect(firstAudit).toHaveLength(2);
+      expect(firstAudit[0]).toMatchObject({
+        from: 'PENDING',
+        to: 'VERIFYING',
+        actorUid: 'cust-1',
+        actorRole: 'customer',
+      });
+      expect(firstAudit[1]).toMatchObject({
+        from: 'PENDING',
+        to: 'PAID',
+        actorUid: 'admin-1',
+        actorRole: 'admin',
+      });
+
+      const writes = state.store.writes;
+      const repeated = await status('cod-existing-audit', 'COMPLETED');
+      expect(repeated.status).toBe(200);
+      expect(state.store.writes).toBe(writes);
+
+      const afterAudit = stored('cod-existing-audit')['paymentAudit'] as Array<
+        Record<string, unknown>
+      >;
+      const afterDecision = stored('cod-existing-audit')[
+        'paymentDecision'
+      ] as Record<string, unknown>;
+      expect(afterAudit).toHaveLength(2);
+      expect(afterDecision).toEqual(firstDecision);
+      expect(stored('cod-existing-audit')['paymentStatus']).toBe('PAID');
+    });
+
+    it('refuses READY -> COMPLETED so an order must go On the Way first', async () => {
       expect((await status('cod-pending', 'CONFIRMED')).status).toBe(200);
       expect((await status('cod-pending', 'PREPARING')).status).toBe(200);
       expect((await status('cod-pending', 'READY')).status).toBe(200);
       const completed = await status('cod-pending', 'COMPLETED');
-      expect(completed.status).toBe(200);
-      expect(stored('cod-pending')['orderStatus']).toBe('COMPLETED');
+      expect(completed.status).toBe(400);
+      expect(
+        ((await completed.json()) as { error: { code: string } }).error.code
+      ).toBe('invalid_status_transition');
+      expect(stored('cod-pending')['orderStatus']).toBe('READY');
       expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
+    });
+
+    it('never marks COD paid when an order is cancelled', async () => {
+      expect((await status('cod-pending', 'CONFIRMED')).status).toBe(200);
+      expect((await status('cod-pending', 'PREPARING')).status).toBe(200);
+      expect((await status('cod-pending', 'READY')).status).toBe(200);
+      expect((await status('cod-pending', 'OUT_FOR_DELIVERY')).status).toBe(200);
+      expect((await status('cod-pending', 'CANCELLED')).status).toBe(200);
+      expect(stored('cod-pending')['orderStatus']).toBe('CANCELLED');
+      expect(stored('cod-pending')['paymentStatus']).toBe('PENDING');
+      expect(stored('cod-pending')['paymentAudit']).toBeUndefined();
     });
 
     it('refuses to collect COD before the order is COMPLETED', async () => {
@@ -744,6 +834,15 @@ describe('GCash payment proof and payment status correction', () => {
       const gcash = await confirmCod('g-with-proof', 'valid-admin');
       expect(gcash.status).toBe(409);
       expect(stored('cod-completed')['paymentStatus']).toBe('PENDING');
+    });
+
+    it('never marks a GCash order PAID merely because it is delivered', async () => {
+      const completed = await status('g-on-way', 'COMPLETED');
+      expect(completed.status).toBe(200);
+      expect(stored('g-on-way')['orderStatus']).toBe('COMPLETED');
+      // GCash still needs the authorized admin payment decision.
+      expect(stored('g-on-way')['paymentStatus']).toBe('VERIFYING');
+      expect(stored('g-on-way')['paymentAudit']).toBeUndefined();
     });
 
     it('keeps a completed GCash order VERIFYING until an admin decides', async () => {

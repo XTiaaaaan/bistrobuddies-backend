@@ -227,15 +227,17 @@ customer responses.
 
 ### Status graph (admin only)
 
-`PENDING → CONFIRMED → PREPARING → READY → COMPLETED`; delivery orders may also
-go `READY → OUT_FOR_DELIVERY → COMPLETED`, while pickup orders go directly
-`READY → COMPLETED`. `OUT_FOR_DELIVERY` is only reachable from `READY`, and
+`PENDING → CONFIRMED → PREPARING → READY → OUT_FOR_DELIVERY → COMPLETED`.
+All orders are delivered, so `COMPLETED` is only reachable from
+`OUT_FOR_DELIVERY`; `OUT_FOR_DELIVERY` is only reachable from `READY`, and
 `CANCELLED` is reachable from every non-terminal state. Re-sending the current
 status is an idempotent no-op; anything else → `400 invalid_status_transition`.
-`OUT_FOR_DELIVERY` is the internal value; clients should display the
-`orderStatusLabel` field (`"On the Way"`). Status transitions never change
-`paymentStatus`; COD cash collection is recorded only via the explicit
-`/cod-payment` endpoint.
+`OUT_FOR_DELIVERY` and `COMPLETED` are the internal values; clients should
+display the `orderStatusLabel` field (`"On the Way"` and `"Delivered"`).
+Payment and fulfilment stay separate fields, but a COD order reaching
+`COMPLETED` records the successful cash collection as `PAID` in the same
+transaction. GCash orders are never marked `PAID` by a status change, and
+cancelling an order never changes payment.
 
 ### Customer order cancellation
 
@@ -271,10 +273,12 @@ reviews the proof and records the decision here. The submitted name/details do
 not prove payment on their own; only an admin decision marks a GCash order
 `PAID`, and that decision requires proof to have been submitted.
 
-`orderStatus` and `paymentStatus` are always independent: dispatching or
-completing an order never marks it paid, for either GCash or COD. For COD, cash
-collection is recorded explicitly by an admin via `/cod-payment` (see "COD
-collection").
+`orderStatus` and `paymentStatus` are separate fields. Dispatching an order
+never marks it paid, and completing a GCash order never marks it paid: GCash
+still requires an authorized admin decision. When a COD order reaches
+`COMPLETED`, the backend records the cash collection as `PAID` automatically;
+`/cod-payment` remains the idempotent explicit confirmation for an
+already-completed COD order (see "COD collection").
 
 **Payment-status transitions** (`paymentStatus` is independent of the
 fulfilment field `orderStatus`; confirming payment never completes an order):
@@ -288,7 +292,7 @@ fulfilment field `orderStatus`; confirming payment never completes an order):
 | `VERIFYING` | `REJECTED` | admin | rejection |
 | `PAID` | `PAID` | admin | idempotent no-op (writes nothing) |
 | `REJECTED` | `REJECTED` | admin | idempotent no-op (writes nothing) |
-| `PENDING` | `PAID` | admin (`POST …/payment` or `…/cod-payment`, COD only) | explicit cash collection record; order must be `COMPLETED` |
+| `PENDING` | `PAID` | backend on `COMPLETED` (COD only), or admin (`POST …/payment` / `…/cod-payment`) | automatic on successful delivery; explicit action remains idempotent |
 
 Anything else is rejected: `PAID` can never be overwritten, `REJECTED` can
 only become `PAID` after the customer resubmits (never directly), and an
@@ -358,9 +362,10 @@ order. Image bytes/base64 are never stored in Firestore.
 - For a GCash `PAID` decision the order must be `VERIFYING` with submitted
   details **and** proof (`409 payment_details_required` /
   `409 payment_proof_required` otherwise). Rejection only requires details.
-- For a COD order, this same endpoint may confirm collection with
-  `{ "decision": "PAID" }` only once the order is `COMPLETED`; COD `REJECTED`
-  is not a valid collection state, and unfinished COD orders are refused with
+- For a COD order, this same endpoint may explicitly confirm collection with
+  `{ "decision": "PAID" }` once the order is `COMPLETED` (normally already
+  settled automatically by the status transition); COD `REJECTED` is not a
+  valid collection state, and unfinished COD orders are refused with
   `409 invalid_payment_transition`. `POST …/payment-proof` is an alias of this
   endpoint.
 - The admin UID and decision timestamp are stored (`paymentDecision`) and an
@@ -376,12 +381,13 @@ order. Image bytes/base64 are never stored in Firestore.
 
 **Admin — POST /api/admin/orders/:id/cod-payment** (admin only, 60/min/IP):
 
-Explicitly records that cash was collected for a COD order. The optional body
+Explicitly confirms that cash was collected for a COD order. The optional body
 may be `{ "decision": "PAID" }` or omitted. Only `COD` orders that are already
 `COMPLETED` are accepted, and only `PAID` is a valid target; the order status
-is untouched. Reaching `COMPLETED` never settles COD automatically, so this
-explicit action is the only way to record cash collection. Like the GCash
-decision, it is transactional and idempotent.
+is untouched. A COD order is normally settled automatically when it reaches
+`COMPLETED`, so this action is an idempotent confirmation rather than the only
+way to record collection. Like the GCash decision, it is transactional and
+idempotent.
 
 ### Manual refunds (no gateway)
 

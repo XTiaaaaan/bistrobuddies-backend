@@ -301,11 +301,13 @@ describe('order status transitions', () => {
     );
   });
 
-  it('allows the documented forward path', () => {
+  it('allows the documented delivery path', () => {
     expect(allowedNextStatuses('PENDING')).toEqual(['CONFIRMED', 'CANCELLED']);
     expect(allowedNextStatuses('CONFIRMED')).toContain('PREPARING');
     expect(allowedNextStatuses('PREPARING')).toContain('READY');
-    expect(allowedNextStatuses('READY')).toContain('COMPLETED');
+    expect(allowedNextStatuses('READY')).toContain('OUT_FOR_DELIVERY');
+    expect(allowedNextStatuses('READY')).not.toContain('COMPLETED');
+    expect(allowedNextStatuses('OUT_FOR_DELIVERY')).toContain('COMPLETED');
   });
 
   it('blocks backward and terminal transitions', () => {
